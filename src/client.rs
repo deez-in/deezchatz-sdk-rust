@@ -79,6 +79,13 @@ pub struct DeezChatzClient {
     mqtt: Option<MqttService>,
 }
 
+/// Result of successfully sending an end-to-end encrypted message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SentMessage {
+    pub message_id: String,
+    pub recipient_user_id: String,
+}
+
 impl DeezChatzClient {
     /// Creates a new uninitialized SDK client with persistent storage providers.
     pub fn new(
@@ -100,6 +107,14 @@ impl DeezChatzClient {
             device_id: None,
             mqtt: None,
         }
+    }
+
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
     }
 
     /// Complete 2-phase API registration using PKCE OAuth authorization code:
@@ -196,20 +211,21 @@ impl DeezChatzClient {
         self.user_id = Some(user_id.to_string());
         self.device_id = Some(device_id.to_string());
 
-        let id_key = self
+        let spk = self
             .keystore
-            .get_identity_key()
+            .get_signed_pre_key(1)
             .await?
-            .ok_or_else(|| SdkError::Storage("Identity key missing from keystore".into()))?;
+            .ok_or_else(|| SdkError::Storage("Signed Pre-Key missing from keystore".into()))?;
 
         let (tx, rx) = mpsc::channel(100);
 
         let mqtt_service = MqttService::new(
             &self.config.mqtt_url,
             self.config.mqtt_port,
+            self.config.use_tls,
             user_id,
             device_id,
-            &id_key.0,
+            &spk.0,
             tx,
             self.sessionstore.clone(),
             self.inboxstore.clone(),
@@ -223,14 +239,15 @@ impl DeezChatzClient {
     }
 
     /// Sends an end-to-end encrypted message to a recipient using persistent outbox queuing.
+    /// Result of successfully dispatching a message via the SDK.
     ///
     /// - Performs X3DH Session Establishment if no active Double Ratchet session exists.
     /// - Encrypts the payload.
     /// - Saves the ciphertext immediately to persistent `OutboxStore` as 'pending'.
     /// - Attempts live MQTT publish (if connected); otherwise the entry stays queued
     ///   in the Outbox and will be automatically delivered upon reconnection.
-    /// - Returns the generated unique `message_id`.
-    pub async fn send_message(&self, recipient_identifier: &str, payload: &[u8]) -> Result<String, SdkError> {
+    /// - Returns the generated unique `message_id` and the resolved `recipient_user_id`.
+    pub async fn send_message(&self, recipient_identifier: &str, payload: &[u8]) -> Result<SentMessage, SdkError> {
         use crate::crypto::{EncryptedPayload, ActiveSession, construct_ad, decode_b64_33, decode_b64_96};
         use libsignal_dezire::x3dh::{PreKeyBundle, SignedPreKey, OneTimePreKey, x3dh_initiator};
         use libsignal_dezire::ratchet::{init_sender_state, encrypt as ratchet_encrypt};
@@ -266,7 +283,8 @@ impl DeezChatzClient {
             recipient_device_id = active_session.remote_device_id.clone();
         } else {
             // No session -> Fetch pre-key bundle from REST API
-            let bundle = self.api.get_bundle(user_id, &id_key.0, recipient_identifier).await?;
+            let spk = self.keystore.get_signed_pre_key(1).await?.ok_or_else(|| SdkError::Storage("Missing SPK for auth".into()))?;
+            let bundle = self.api.get_bundle(user_id, &spk.0, recipient_identifier).await?;
             recipient_id = bundle.user_id.clone();
             recipient_device_id = bundle.device_id.clone();
 
@@ -327,6 +345,9 @@ impl DeezChatzClient {
         // Save updated state
         let session_bytes = serde_json::to_vec(&active_session).map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;
         self.sessionstore.save_session(recipient_identifier, &session_bytes).await?;
+        if recipient_identifier != recipient_id {
+            let _ = self.sessionstore.save_session(&recipient_id, &session_bytes).await;
+        }
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -369,14 +390,79 @@ impl DeezChatzClient {
             let _ = mqtt.send_payload(outbox_id, &topic, payload_json).await;
         }
 
-        Ok(message_id)
+        Ok(SentMessage {
+            message_id,
+            recipient_user_id: recipient_id,
+        })
+    }
+
+    /// Higher-order method: Encodes a UTF-8 text message with 1:1 framing ([0x00, ...utf8Bytes])
+    /// matching `deezchatz-mobile` and delegates to the low-level `send_message`.
+    pub async fn send_text_message(&self, recipient_identifier: &str, text: &str) -> Result<SentMessage, SdkError> {
+        let framed = crate::payload::encode_text_payload(text);
+        self.send_message(recipient_identifier, &framed).await
+    }
+
+    /// Higher-order method: Encodes raw Opus audio bytes with 1:1 framing ([0x01, ...audioBytes])
+    /// matching `deezchatz-mobile` and delegates to the low-level `send_message`.
+    pub async fn send_voice_message(&self, recipient_identifier: &str, audio_bytes: &[u8]) -> Result<SentMessage, SdkError> {
+        let framed = crate::payload::encode_voice_payload(audio_bytes);
+        self.send_message(recipient_identifier, &framed).await
+    }
+
+    /// Higher-order method: Encodes an image with 1:1 framing
+    /// `[0x02, 4-byte timestamp BE, 2-byte caption length BE, caption UTF-8 bytes, raw JPEG bytes]`
+    /// matching `deezchatz-mobile` using the current timestamp, and delegates to the low-level `send_message`.
+    pub async fn send_image_message(
+        &self,
+        recipient_identifier: &str,
+        image_bytes: &[u8],
+        caption: Option<&str>,
+    ) -> Result<SentMessage, SdkError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let timestamp_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SdkError::InvalidOperation(format!("System time error: {}", e)))?
+            .as_secs() as u32;
+
+        self.send_image_message_with_timestamp(
+            recipient_identifier,
+            image_bytes,
+            caption,
+            timestamp_seconds,
+        )
+        .await
+    }
+
+    /// Higher-order method: Encodes an image with an explicit timestamp and 1:1 framing matching `deezchatz-mobile`.
+    pub async fn send_image_message_with_timestamp(
+        &self,
+        recipient_identifier: &str,
+        image_bytes: &[u8],
+        caption: Option<&str>,
+        timestamp_seconds: u32,
+    ) -> Result<SentMessage, SdkError> {
+        let caption_str = caption.unwrap_or("");
+        let framed = crate::payload::encode_image_payload(timestamp_seconds, caption_str, image_bytes);
+        self.send_message(recipient_identifier, &framed).await
+    }
+
+    /// Higher-order method: Encodes a typed `DecodedPayload` matching `deezchatz-mobile` framing
+    /// and delegates to the low-level `send_message`.
+    pub async fn send_payload(
+        &self,
+        recipient_identifier: &str,
+        payload: &crate::payload::DecodedPayload,
+    ) -> Result<SentMessage, SdkError> {
+        let framed = payload.encode();
+        self.send_message(recipient_identifier, &framed).await
     }
 
     /// Fetches read-only profile data and identity key for a contact without popping an OPK.
     pub async fn get_sync_bundle(&self, target_user_id: &str) -> Result<SyncBundleResponse, SdkError> {
         let user_id = self.user_id.as_ref().ok_or_else(|| SdkError::InvalidOperation("User ID not set".into()))?;
-        let id_key = self.keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Missing identity key".into()))?;
+        let spk = self.keystore.get_signed_pre_key(1).await?.ok_or_else(|| SdkError::Storage("Missing SPK".into()))?;
 
-        self.api.get_sync_bundle(user_id, &id_key.0, target_user_id).await
+        self.api.get_sync_bundle(user_id, &spk.0, target_user_id).await
     }
 }

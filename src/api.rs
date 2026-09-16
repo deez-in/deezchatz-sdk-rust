@@ -99,8 +99,8 @@ impl ApiClient {
     }
 
     /// Helper to attach stateless signature authentication headers.
-    fn auth_headers(&self, user_id: &str, identity_private: &[u8; 32]) -> Result<HeaderMap, SdkError> {
-        let (uid, ts, sig, vrf) = generate_auth_headers(user_id, identity_private)?;
+    fn auth_headers(&self, user_id: &str, signing_private_key: &[u8; 32]) -> Result<HeaderMap, SdkError> {
+        let (uid, ts, sig, vrf) = generate_auth_headers(user_id, signing_private_key)?;
         let mut headers = HeaderMap::new();
         headers.insert("X-User-Id", HeaderValue::from_str(&uid).map_err(|e| SdkError::Api(e.to_string()))?);
         headers.insert("X-Timestamp", HeaderValue::from_str(&ts).map_err(|e| SdkError::Api(e.to_string()))?);
@@ -166,10 +166,10 @@ impl ApiClient {
         let (state_signature, state_vrf) = sign_payload(identity_private, state.as_bytes())?;
         
         let spk_b64 = STANDARD.encode(signed_pre_key_pub);
-        let (pre_key_sign, pre_key_vrf) = sign_payload(identity_private, spk_b64.as_bytes())?;
+        let (pre_key_sign, pre_key_vrf) = sign_payload(identity_private, signed_pre_key_pub)?;
 
         let sdk_b64 = STANDARD.encode(signed_device_key_pub);
-        let (dev_key_sign, dev_key_vrf) = sign_payload(identity_private, sdk_b64.as_bytes())?;
+        let (dev_key_sign, dev_key_vrf) = sign_payload(identity_private, signed_device_key_pub)?;
 
         let opks_b64: Vec<String> = opks_pub.iter().map(|k| STANDARD.encode(k)).collect();
 
@@ -201,11 +201,11 @@ impl ApiClient {
     pub async fn get_bundle(
         &self,
         user_id: &str,
-        identity_private: &[u8; 32],
+        signing_private_key: &[u8; 32],
         identifier: &str,
     ) -> Result<BundleResponse, SdkError> {
         let url = format!("{}/bundle/{}", self.base_url, urlencoding::encode(identifier));
-        let headers = self.auth_headers(user_id, identity_private)?;
+        let headers = self.auth_headers(user_id, signing_private_key)?;
 
         let res = self.client.post(&url).headers(headers).send().await?;
         if !res.status().is_success() {
@@ -220,11 +220,11 @@ impl ApiClient {
     pub async fn get_sync_bundle(
         &self,
         user_id: &str,
-        identity_private: &[u8; 32],
+        signing_private_key: &[u8; 32],
         target_user_id: &str,
     ) -> Result<SyncBundleResponse, SdkError> {
         let url = format!("{}/bundle/sync/{}", self.base_url, urlencoding::encode(target_user_id));
-        let headers = self.auth_headers(user_id, identity_private)?;
+        let headers = self.auth_headers(user_id, signing_private_key)?;
 
         let res = self.client.get(&url).headers(headers).send().await?;
         if !res.status().is_success() {

@@ -1,4 +1,4 @@
-use rumqttc::{AsyncClient, MqttOptions, QoS, Event as MqttEvent, Incoming};
+use rumqttc::{AsyncClient, MqttOptions, QoS, Event as MqttEvent, Incoming, Transport};
 use std::time::Duration;
 use std::sync::Arc;
 use crate::error::SdkError;
@@ -109,36 +109,44 @@ async fn decrypt_message(
     Ok(plaintext)
 }
 
+fn generate_mqtt_password(user_id: &str, signing_key: &[u8; 32]) -> Result<String, SdkError> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| SdkError::Mqtt(e.to_string()))?
+        .as_secs()
+        .to_string();
+
+    let payload = format!("{}{}", user_id, ts);
+    let (sig, vrf) = sign_payload(signing_key, payload.as_bytes())?;
+    Ok(format!("{}{}{}", sig, vrf, ts))
+}
+
 impl MqttService {
     /// Initializes the MQTT client and spawns a background worker handling
     /// persistent inbox saving, outbox queue flushing, and reconnection retries.
     pub fn new(
         broker_url: &str,
         broker_port: u16,
+        use_tls: bool,
         user_id: &str,
         device_id: &str,
-        identity_private: &[u8; 32],
+        signed_pre_key_private: &[u8; 32],
         event_sender: tokio::sync::mpsc::Sender<Event>,
         session_store: Arc<dyn SessionStore>,
         inbox_store: Arc<dyn InboxStore>,
         outbox_store: Arc<dyn OutboxStore>,
         keystore: Arc<dyn KeyStore>,
     ) -> Result<Self, SdkError> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| SdkError::Mqtt(e.to_string()))?
-            .as_secs()
-            .to_string();
-
-        let payload = format!("{}{}", user_id, ts);
-        let (sig, vrf) = sign_payload(identity_private, payload.as_bytes())?;
-        
-        let password = format!("{}{}{}", sig, vrf, ts);
+        let password = generate_mqtt_password(user_id, signed_pre_key_private)?;
 
         let mut mqttoptions = MqttOptions::new(device_id, broker_url, broker_port);
         mqttoptions.set_credentials(user_id, password);
         mqttoptions.set_keep_alive(Duration::from_secs(60));
         mqttoptions.set_clean_session(false);
+
+        if use_tls {
+            mqttoptions.set_transport(Transport::tls_with_default_config());
+        }
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 50);
         
@@ -146,9 +154,9 @@ impl MqttService {
         let uid = user_id.to_string();
         let did = device_id.to_string();
         let inbox = inbox_store.clone();
-        let outbox = outbox_store.clone();
         let sessions = session_store.clone();
         let keystore_clone = keystore.clone();
+        let spk_priv = *signed_pre_key_private;
 
         tokio::spawn(async move {
             loop {
@@ -157,22 +165,6 @@ impl MqttService {
                         let topic = format!("/deezchatz/{}/{}/#", uid, did);
                         let _ = client_clone.subscribe(topic, QoS::AtLeastOnce).await;
                         let _ = event_sender.send(Event::Connected).await;
-
-                        if let Ok(pending_outbox) = outbox.get_pending_outbox().await {
-                            for item in pending_outbox {
-                                match client_clone
-                                    .publish(item.topic.clone(), QoS::AtLeastOnce, false, item.payload.clone())
-                                    .await
-                                {
-                                    Ok(_) => {
-                                        let _ = outbox.mark_outbox_sent(item.id).await;
-                                    }
-                                    Err(e) => {
-                                        let _ = outbox.mark_outbox_failed(item.id, &e.to_string()).await;
-                                    }
-                                }
-                            }
-                        }
 
                         if let Ok(pending_inbox) = inbox.get_pending_inbox().await {
                             for item in pending_inbox {
@@ -226,6 +218,11 @@ impl MqttService {
                     Err(_) => {
                         let _ = event_sender.send(Event::Disconnected).await;
                         tokio::time::sleep(Duration::from_secs(3)).await;
+
+                        // Refresh credentials with a fresh timestamp and signature before reconnecting
+                        if let Ok(new_password) = generate_mqtt_password(&uid, &spk_priv) {
+                            eventloop.mqtt_options.set_credentials(&uid, new_password);
+                        }
                     }
                     _ => {}
                 }
@@ -253,4 +250,51 @@ impl MqttService {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libsignal_dezire::vxeddsa::gen_keypair;
+
+    #[test]
+    fn test_generate_mqtt_password() {
+        let keypair = gen_keypair();
+        let user_id = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+        let password = generate_mqtt_password(user_id, &keypair.secret).expect("failed to generate password");
+        // 128 (signature base64) + 44 (vrf base64) + 10 (unix timestamp) = 182 characters
+        assert_eq!(password.len(), 182);
+
+        let sig_b64 = &password[..128];
+        let vrf_b64 = &password[128..172];
+        let ts_str = &password[172..];
+
+        let ts: u64 = ts_str.parse().expect("timestamp should be an integer");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        assert!(now.abs_diff(ts) <= 2);
+
+        // Verify that signature is valid with the public key
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use libsignal_dezire::vxeddsa::vxeddsa_verify;
+
+        let sig_bytes = STANDARD.decode(sig_b64).expect("valid sig base64");
+        let vrf_bytes = STANDARD.decode(vrf_b64).expect("valid vrf base64");
+        let payload = format!("{}{}", user_id, ts_str);
+
+        let mut sig_arr = [0u8; 96];
+        sig_arr.copy_from_slice(&sig_bytes);
+        let verified_vrf = vxeddsa_verify(&keypair.public, payload.as_bytes(), &sig_arr).expect("signature should verify");
+        assert_eq!(verified_vrf.as_slice(), vrf_bytes.as_slice());
+    }
+
+    #[test]
+    fn test_mqtt_transport_tls() {
+        let mut options = MqttOptions::new("test-device", "mqtt.deez.in", 8883);
+        options.set_transport(Transport::tls_with_default_config());
+        match options.transport() {
+            Transport::Tls(_) => {}
+            _ => panic!("Expected Transport::Tls"),
+        }
+    }
+}
+
 

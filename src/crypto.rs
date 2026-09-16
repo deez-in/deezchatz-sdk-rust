@@ -35,9 +35,9 @@ pub fn generate_registration_keys(opk_count: u32) -> RegistrationKeys {
     }
 }
 
-/// Helper to sign payloads using the identity key (for REST authentication).
-pub fn sign_payload(identity_private_key: &[u8; 32], payload: &[u8]) -> Result<(String, String), SdkError> {
-    let out = vxeddsa_sign(identity_private_key, payload)
+/// Helper to sign payloads using the signing key (for REST authentication).
+pub fn sign_payload(signing_private_key: &[u8; 32], payload: &[u8]) -> Result<(String, String), SdkError> {
+    let out = vxeddsa_sign(signing_private_key, payload)
         .map_err(|_| SdkError::Crypto("Failed to sign payload".to_string()))?;
     
     use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -50,7 +50,7 @@ pub fn sign_payload(identity_private_key: &[u8; 32], payload: &[u8]) -> Result<(
 /// Generates the required Auth Headers for stateless API requests.
 pub fn generate_auth_headers(
     user_id: &str,
-    identity_private_key: &[u8; 32],
+    signing_private_key: &[u8; 32],
 ) -> Result<(String, String, String, String), SdkError> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -59,7 +59,7 @@ pub fn generate_auth_headers(
         .to_string();
 
     let payload = format!("{}{}", user_id, timestamp);
-    let (signature, vrf) = sign_payload(identity_private_key, payload.as_bytes())?;
+    let (signature, vrf) = sign_payload(signing_private_key, payload.as_bytes())?;
 
     Ok((user_id.to_string(), timestamp, signature, vrf))
 }

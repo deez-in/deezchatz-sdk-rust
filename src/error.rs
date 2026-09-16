@@ -20,4 +20,7 @@ pub enum SdkError {
 
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    #[error("Payload error: {0}")]
+    Payload(#[from] crate::payload::PayloadError),
 }

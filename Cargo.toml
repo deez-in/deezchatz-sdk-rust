@@ -14,7 +14,7 @@ thiserror = "1.0"
 
 # Networking
 reqwest = { version = "0.12", features = ["json"] }
-rumqttc = "0.24"
+rumqttc = { version = "0.24", features = ["use-rustls"] }
 
 # Crypto / Signal Protocol (using the local sibling repo)
 libsignal-dezire = { path = "../libsignal-dezire" }
