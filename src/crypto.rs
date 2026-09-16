@@ -63,3 +63,60 @@ pub fn generate_auth_headers(
 
     Ok((user_id.to_string(), timestamp, signature, vrf))
 }
+
+use serde::{Deserialize, Serialize};
+use libsignal_dezire::ratchet::RatchetState;
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EncryptedPayload {
+    pub ciphertext: String,
+    pub header: String,
+    pub timestamp: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spk_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opk_id: Option<u32>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ActiveSession {
+    pub ratchet_state: RatchetState,
+    pub remote_identity_pub: [u8; 33],
+    pub remote_user_id: String,
+    pub remote_device_id: String,
+}
+
+pub fn construct_ad(sender_id_pub: &[u8; 33], receiver_id_pub: &[u8; 33]) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(66);
+    ad.extend_from_slice(sender_id_pub);
+    ad.extend_from_slice(receiver_id_pub);
+    ad
+}
+
+/// Helper to decode base64 strings into fixed size arrays
+pub fn decode_b64_33(b64: &str) -> Result<[u8; 33], SdkError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(b64).map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
+    if bytes.len() != 33 {
+        return Err(SdkError::Crypto(format!("Invalid key length: {}", bytes.len())));
+    }
+    let mut out = [0u8; 33];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+pub fn decode_b64_96(b64: &str) -> Result<[u8; 96], SdkError> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let bytes = STANDARD.decode(b64).map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
+    if bytes.len() != 96 {
+        return Err(SdkError::Crypto(format!("Invalid sig length: {}", bytes.len())));
+    }
+    let mut out = [0u8; 96];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}

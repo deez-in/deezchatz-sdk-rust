@@ -214,6 +214,7 @@ impl DeezChatzClient {
             self.sessionstore.clone(),
             self.inboxstore.clone(),
             self.outboxstore.clone(),
+            self.keystore.clone(),
         )?;
 
         self.mqtt = Some(mqtt_service);
@@ -229,7 +230,13 @@ impl DeezChatzClient {
     /// - Attempts live MQTT publish (if connected); otherwise the entry stays queued
     ///   in the Outbox and will be automatically delivered upon reconnection.
     /// - Returns the generated unique `message_id`.
-    pub async fn send_message(&self, recipient_identifier: &str, text: &str) -> Result<String, SdkError> {
+    pub async fn send_message(&self, recipient_identifier: &str, payload: &[u8]) -> Result<String, SdkError> {
+        use crate::crypto::{EncryptedPayload, ActiveSession, construct_ad, decode_b64_33, decode_b64_96};
+        use libsignal_dezire::x3dh::{PreKeyBundle, SignedPreKey, OneTimePreKey, x3dh_initiator};
+        use libsignal_dezire::ratchet::{init_sender_state, encrypt as ratchet_encrypt};
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let user_id = self
             .user_id
             .as_ref()
@@ -246,23 +253,99 @@ impl DeezChatzClient {
             .ok_or_else(|| SdkError::Storage("Identity key missing from keystore".into()))?;
 
         // 1. Check for existing Double Ratchet session
-        let existing_session = self.sessionstore.get_session(recipient_identifier).await?;
+        let existing_session_bytes = self.sessionstore.get_session(recipient_identifier).await?;
 
-        let (recipient_id, recipient_device_id) = if existing_session.is_none() {
+        let mut active_session: ActiveSession;
+        let mut x3dh_init_data = None;
+        let recipient_id: String;
+        let recipient_device_id: String;
+
+        if let Some(bytes) = existing_session_bytes {
+            active_session = serde_json::from_slice(&bytes).map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?;
+            recipient_id = active_session.remote_user_id.clone();
+            recipient_device_id = active_session.remote_device_id.clone();
+        } else {
             // No session -> Fetch pre-key bundle from REST API
             let bundle = self.api.get_bundle(user_id, &id_key.0, recipient_identifier).await?;
+            recipient_id = bundle.user_id.clone();
+            recipient_device_id = bundle.device_id.clone();
 
-            // Save mock session state
-            self.sessionstore
-                .save_session(recipient_identifier, b"mock_session_state")
-                .await?;
-            (bundle.user_id, bundle.device_id)
-        } else {
-            (recipient_identifier.to_string(), "mock_device_id".to_string())
-        };
+            let bundle_identity_pub = decode_b64_33(&bundle.identity_key)?;
+            let bundle_spk_pub = decode_b64_33(&bundle.signed_pre_key)?;
+            let bundle_sig = decode_b64_96(&bundle.signature)?;
+
+            let opk = match &bundle.opk {
+                Some(o) => Some(OneTimePreKey {
+                    id: o.id,
+                    public_key: decode_b64_33(&o.key)?,
+                }),
+                None => None,
+            };
+
+            let prekey_bundle = PreKeyBundle {
+                identity_key: bundle_identity_pub,
+                signed_prekey: SignedPreKey {
+                    id: 1, // backend API doesn't return SPK id, defaults to 1
+                    public_key: bundle_spk_pub,
+                    signature: bundle_sig,
+                },
+                one_time_prekey: opk,
+            };
+
+            let init_result = x3dh_initiator(&id_key.0, &prekey_bundle)
+                .map_err(|e| SdkError::Crypto(format!("X3DH init failed: {:?}", e)))?;
+
+            let ratchet_state = init_sender_state(init_result.shared_secret, bundle_spk_pub)
+                .map_err(|e| SdkError::Crypto(format!("Ratchet init failed: {:?}", e)))?;
+
+            active_session = ActiveSession {
+                ratchet_state,
+                remote_identity_pub: bundle_identity_pub,
+                remote_user_id: recipient_id.clone(),
+                remote_device_id: recipient_device_id.clone(),
+            };
+
+            x3dh_init_data = Some((
+                STANDARD.encode(&id_key.1),
+                STANDARD.encode(&init_result.ephemeral_public),
+                bundle.opk.map(|o| o.id),
+            ));
+        }
 
         // 2. Encrypt payload
-        let ciphertext = format!("ENCRYPTED({})", text).into_bytes();
+        let ad = construct_ad(&id_key.1, &active_session.remote_identity_pub);
+
+        let (enc_header, ciphertext_bytes) = ratchet_encrypt(&mut active_session.ratchet_state, payload, &ad)
+            .map_err(|e| SdkError::Crypto(format!("Ratchet encrypt failed: {:?}", e)))?;
+
+        // Save updated state
+        let session_bytes = serde_json::to_vec(&active_session).map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;
+        self.sessionstore.save_session(recipient_identifier, &session_bytes).await?;
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| SdkError::Crypto(e.to_string()))?
+            .as_millis() as u64;
+
+        let mut enc_payload = EncryptedPayload {
+            ciphertext: STANDARD.encode(&ciphertext_bytes),
+            header: STANDARD.encode(&enc_header),
+            timestamp,
+            identity_key: None,
+            ephemeral_key: None,
+            spk_id: None,
+            opk_id: None,
+        };
+
+        if let Some((ik, ek, opk_id)) = x3dh_init_data {
+            enc_payload.identity_key = Some(ik);
+            enc_payload.ephemeral_key = Some(ek);
+            enc_payload.spk_id = Some(1); // Default SPK ID
+            enc_payload.opk_id = opk_id;
+        }
+
+        let payload_json = serde_json::to_vec(&enc_payload).map_err(|e| SdkError::Crypto(format!("Payload serialize error: {}", e)))?;
+
         let message_id = Uuid::new_v4().to_string();
         let topic = format!(
             "/deezchatz/{}/{}/{}/{}",
@@ -270,15 +353,14 @@ impl DeezChatzClient {
         );
 
         // 3. Save to persistent Outbox queue BEFORE attempting publish
-        // (Ensures the message survives process termination/crashes)
         let outbox_id = self
             .outboxstore
-            .save_to_outbox(&recipient_id, &message_id, &topic, &ciphertext)
+            .save_to_outbox(&recipient_id, &message_id, &topic, &payload_json)
             .await?;
 
-        // 4. Attempt live MQTT publish (if client is currently connected)
+        // 4. Attempt live MQTT publish
         if let Some(mqtt) = &self.mqtt {
-            let _ = mqtt.send_payload(outbox_id, &topic, ciphertext).await;
+            let _ = mqtt.send_payload(outbox_id, &topic, payload_json).await;
         }
 
         Ok(message_id)
