@@ -74,11 +74,18 @@ async fn decrypt_message(
             &sender_ephemeral_pub,
         ).map_err(|e| SdkError::Crypto(format!("X3DH responder failed: {:?}", e)))?;
 
-        let ratchet_state = init_receiver_state(shared_secret, (local_spk.0, local_spk.1));
+        use libsignal_dezire::utils::decode_public_key;
+        use libsignal_dezire::ratchet::{DhPublicKey, DhPrivateKey};
+
+        let spk_priv = DhPrivateKey::from(local_spk.0);
+        let spk_pub_bytes = decode_public_key(&local_spk.1).map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
+        let spk_pub = DhPublicKey::from(spk_pub_bytes);
+
+        let ratchet_state = init_receiver_state(shared_secret, (spk_priv, spk_pub));
 
         active_session = ActiveSession {
             ratchet_state,
-            remote_identity_pub: sender_identity_pub,
+            remote_identity_pub: sender_identity_pub.to_vec(),
             remote_user_id: sender_id.to_string(),
             remote_device_id: String::new(), // Not critical for receiving, just sending
         };

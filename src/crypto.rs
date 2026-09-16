@@ -86,13 +86,13 @@ pub struct EncryptedPayload {
 #[derive(Serialize, Deserialize)]
 pub struct ActiveSession {
     pub ratchet_state: RatchetState,
-    pub remote_identity_pub: [u8; 33],
+    pub remote_identity_pub: Vec<u8>,
     pub remote_user_id: String,
     pub remote_device_id: String,
 }
 
-pub fn construct_ad(sender_id_pub: &[u8; 33], receiver_id_pub: &[u8; 33]) -> Vec<u8> {
-    let mut ad = Vec::with_capacity(66);
+pub fn construct_ad(sender_id_pub: &[u8], receiver_id_pub: &[u8]) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(sender_id_pub.len() + receiver_id_pub.len());
     ad.extend_from_slice(sender_id_pub);
     ad.extend_from_slice(receiver_id_pub);
     ad

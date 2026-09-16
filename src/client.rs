@@ -295,12 +295,18 @@ impl DeezChatzClient {
             let init_result = x3dh_initiator(&id_key.0, &prekey_bundle)
                 .map_err(|e| SdkError::Crypto(format!("X3DH init failed: {:?}", e)))?;
 
-            let ratchet_state = init_sender_state(init_result.shared_secret, bundle_spk_pub)
+            use libsignal_dezire::utils::decode_public_key;
+            use libsignal_dezire::ratchet::DhPublicKey;
+
+            let spk_pub_bytes = decode_public_key(&bundle_spk_pub).map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
+            let spk_pub = DhPublicKey::from(spk_pub_bytes);
+
+            let ratchet_state = init_sender_state(init_result.shared_secret, spk_pub)
                 .map_err(|e| SdkError::Crypto(format!("Ratchet init failed: {:?}", e)))?;
 
             active_session = ActiveSession {
                 ratchet_state,
-                remote_identity_pub: bundle_identity_pub,
+                remote_identity_pub: bundle_identity_pub.to_vec(),
                 remote_user_id: recipient_id.clone(),
                 remote_device_id: recipient_device_id.clone(),
             };
