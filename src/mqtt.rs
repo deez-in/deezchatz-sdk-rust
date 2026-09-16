@@ -36,18 +36,18 @@ async fn decrypt_message(
     let enc_payload: EncryptedPayload = serde_json::from_slice(payload_bytes)
         .map_err(|e| SdkError::Crypto(format!("Invalid payload json: {}", e)))?;
 
-    let existing_session_bytes = sessions.get_session(sender_id).await?;
-    
+    // If the payload carries X3DH handshake fields (identity_key + ephemeral_key) it is
+    // always a fresh session initiation — even when a prior session exists in storage.
+    // This handles re-registration / app reinstall on the remote side.
+    let is_initial = enc_payload.identity_key.is_some() && enc_payload.ephemeral_key.is_some();
+
     let mut active_session: ActiveSession;
 
-    if let Some(bytes) = existing_session_bytes {
-        active_session = serde_json::from_slice(&bytes)
-            .map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?;
-    } else {
-        // Must be an initial message
-        let ik_b64 = enc_payload.identity_key.as_ref().ok_or_else(|| SdkError::Crypto("Missing identityKey for new session".into()))?;
-        let ek_b64 = enc_payload.ephemeral_key.as_ref().ok_or_else(|| SdkError::Crypto("Missing ephemeralKey for new session".into()))?;
-        
+    if is_initial {
+        // Always perform X3DH when the sender explicitly starts a new session
+        let ik_b64 = enc_payload.identity_key.as_ref().unwrap();
+        let ek_b64 = enc_payload.ephemeral_key.as_ref().unwrap();
+
         let sender_identity_pub = decode_b64_33(ik_b64)?;
         let sender_ephemeral_pub = decode_b64_33(ek_b64)?;
         let spk_id = enc_payload.spk_id.unwrap_or(1);
@@ -55,7 +55,7 @@ async fn decrypt_message(
 
         let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
         let local_spk = keystore.get_signed_pre_key(spk_id).await?.ok_or_else(|| SdkError::Storage("SPK missing".into()))?;
-        
+
         let opk_private = if let Some(oid) = opk_id {
             if let Some(k) = keystore.consume_one_time_pre_key(oid).await? {
                 Some(k.0)
@@ -87,8 +87,14 @@ async fn decrypt_message(
             ratchet_state,
             remote_identity_pub: sender_identity_pub.to_vec(),
             remote_user_id: sender_id.to_string(),
-            remote_device_id: String::new(), // Not critical for receiving, just sending
+            remote_device_id: String::new(),
         };
+    } else if let Some(bytes) = sessions.get_session(sender_id).await? {
+        // Subsequent message — use the existing ratchet state
+        active_session = serde_json::from_slice(&bytes)
+            .map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?;
+    } else {
+        return Err(SdkError::Crypto("No session found and message is not an X3DH initial".into()));
     }
 
     let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
@@ -161,9 +167,11 @@ impl MqttService {
         tokio::spawn(async move {
             loop {
                 match eventloop.poll().await {
-                    Ok(MqttEvent::Incoming(Incoming::ConnAck(_))) => {
-                        let topic = format!("/deezchatz/{}/{}/#", uid, did);
-                        let _ = client_clone.subscribe(topic, QoS::AtLeastOnce).await;
+                    Ok(MqttEvent::Incoming(Incoming::ConnAck(ack))) => {
+                        if !ack.session_present {
+                            let topic = format!("/deezchatz/{}/{}/#", uid, did);
+                            let _ = client_clone.subscribe(topic, QoS::AtLeastOnce).await;
+                        }
                         let _ = event_sender.send(Event::Connected).await;
 
                         if let Ok(pending_inbox) = inbox.get_pending_inbox().await {
