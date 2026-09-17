@@ -1,21 +1,32 @@
 use crate::transport::{ApiClient, SyncBundleResponse, Event, MqttService};
 use crate::crypto::{generate_registration_keys, RegistrationKeys, encrypt_message, parse_prekey_bundle};
 use crate::error::SdkError;
-use crate::messaging::{InboxStore, KeyStore, OutboxStore, SessionStore};
+use crate::messaging::{DecodedPayload, InboxStore, KeyStore, OutboxStore, SessionStore};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+/// Configuration settings for the DeezChatz SDK client.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    /// Base URL for the DeezChatz REST API (e.g. `https://api.chatz.deez.in`).
     pub rest_url: String,
+    /// Hostname or IP address of the MQTT broker (e.g. `mqtt.deez.in`).
     pub mqtt_url: String,
+    /// Port number for the MQTT broker (typically `8883` for TLS, `1883` for plaintext).
     pub mqtt_port: u16,
+    /// Number of One-Time Pre-Keys (OPKs) to generate and upload during device registration.
     pub opk_count: u32,
+    /// Whether to use TLS encryption when connecting to the MQTT broker.
     pub use_tls: bool,
 }
 
 impl ClientConfig {
+    /// Returns the preset configuration for the production DeezChatz environment.
+    ///
+    /// - REST API: `https://api.chatz.deez.in`
+    /// - MQTT Broker: `mqtt.deez.in:8883` (TLS enabled)
+    /// - OPK count: 100
     pub fn production() -> Self {
         Self {
             rest_url: "https://api.chatz.deez.in".to_string(),
@@ -26,6 +37,11 @@ impl ClientConfig {
         }
     }
 
+    /// Returns the preset configuration for local development.
+    ///
+    /// - REST API: `http://localhost:3000`
+    /// - MQTT Broker: `localhost:1883` (TLS disabled)
+    /// - OPK count: 100
     pub fn development() -> Self {
         Self {
             rest_url: "http://localhost:3000".to_string(),
@@ -36,6 +52,13 @@ impl ClientConfig {
         }
     }
 
+    /// Loads configuration from standard environment variables with production defaults:
+    ///
+    /// - `DEEZCHATZ_API_URL`: REST API base URL (default: `https://api.chatz.deez.in`)
+    /// - `DEEZCHATZ_MQTT_URL`: MQTT host (default: `mqtt.deez.in`)
+    /// - `DEEZCHATZ_MQTT_PORT`: MQTT port (default: `8883`)
+    /// - `DEEZCHATZ_OPK_COUNT`: OPK count (default: `100`)
+    /// - `DEEZCHATZ_USE_TLS`: Enable TLS (`"true"`, `"1"`, or inferred from port 8883)
     pub fn from_env() -> Self {
         let rest_url = std::env::var("DEEZCHATZ_API_URL")
             .unwrap_or_else(|_| "https://api.chatz.deez.in".to_string());
@@ -63,6 +86,10 @@ impl ClientConfig {
     }
 }
 
+/// The main programmatic entrypoint for interacting with DeezChatz.
+///
+/// Encapsulates cryptographic key operations, session ratcheting, REST API calls,
+/// and persistent MQTT transport.
 pub struct DeezChatzClient {
     config: ClientConfig,
     api: ApiClient,
@@ -75,13 +102,20 @@ pub struct DeezChatzClient {
     mqtt: Option<MqttService>,
 }
 
+/// Metadata returned upon successfully enqueueing and publishing an encrypted message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMessage {
+    /// Unique identifier (UUIDv4) assigned to the outbound message.
     pub message_id: String,
+    /// The canonical recipient user ID (UUID) resolved for this message.
     pub recipient_user_id: String,
 }
 
 impl DeezChatzClient {
+    /// Constructs a new [`DeezChatzClient`] instance.
+    ///
+    /// Requires storage backend implementations for [`KeyStore`], [`SessionStore`],
+    /// [`InboxStore`], and [`OutboxStore`].
     pub fn new(
         config: ClientConfig,
         keystore: Arc<dyn KeyStore>,
@@ -103,14 +137,21 @@ impl DeezChatzClient {
         }
     }
 
+    /// Returns the authenticated user's ID if currently registered or connected.
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
     }
 
+    /// Returns the current device's ID if registered or connected.
     pub fn device_id(&self) -> Option<&str> {
         self.device_id.as_deref()
     }
 
+    /// Registers a new device using Google OAuth 2.0 PKCE authorization code flow.
+    ///
+    /// Generates identity keys, signed pre-keys, and OPKs, completes the OAuth exchange
+    /// with the DeezChatz backend, registers the device with cryptographically signed keys,
+    /// and saves all generated keys to the [`KeyStore`].
     pub async fn register_with_pkce(
         &mut self,
         code: &str,
@@ -133,23 +174,6 @@ impl DeezChatzClient {
         self.finalize_registration(&oauth_res.state, phone_number, keys).await
     }
 
-    pub async fn register(
-        &mut self,
-        id_token: &str,
-        phone_number: &str,
-    ) -> Result<(), SdkError> {
-        let keys = generate_registration_keys(self.config.opk_count);
-
-        let g_res = crate::oauth::register_google(
-            &self.api.client,
-            &self.api.base_url,
-            id_token,
-            &keys.identity_key.public,
-        )
-        .await?;
-
-        self.finalize_registration(&g_res.state, phone_number, keys).await
-    }
 
     async fn finalize_registration(
         &mut self,
@@ -193,6 +217,12 @@ impl DeezChatzClient {
         Ok(())
     }
 
+    /// Connects to the MQTT broker for real-time messaging.
+    ///
+    /// Generates a time-limited VXEdDSA cryptographic password using the Signed Pre-Key,
+    /// subscribes to the client's topic (`/deezchatz/{user_id}/{device_id}/#`), starts the
+    /// background event loop handling inbox persistence, outbox delivery, and reconnection,
+    /// and returns an asynchronous channel receiver for [`Event`]s.
     pub async fn connect(&mut self, user_id: &str, device_id: &str) -> Result<mpsc::Receiver<Event>, SdkError> {
         self.user_id = Some(user_id.to_string());
         self.device_id = Some(device_id.to_string());
@@ -224,6 +254,15 @@ impl DeezChatzClient {
         Ok(rx)
     }
 
+    /// Sends an end-to-end encrypted binary payload to a recipient.
+    ///
+    /// If an active Double Ratchet session already exists with the recipient, the message
+    /// is encrypted using the advancing ratchet keys. If no session exists, the client
+    /// transparently queries the recipient's pre-key bundle from the REST API (`POST /bundle/{id}`),
+    /// performs the X3DH key exchange, establishes the ratchet session, stores the session in [`SessionStore`],
+    /// enqueues the encrypted message into [`OutboxStore`], and transmits it via MQTT.
+    ///
+    /// Returns [`SentMessage`] containing the generated `message_id` and resolved `recipient_user_id`.
     pub async fn send_message(&self, recipient_identifier: &str, payload: &[u8]) -> Result<SentMessage, SdkError> {
         let user_id = self
             .user_id
@@ -292,16 +331,26 @@ impl DeezChatzClient {
         })
     }
 
+    /// Encodes and sends a UTF-8 text message.
+    ///
+    /// Frames the text with the `0x00` discriminator byte before end-to-end encryption.
     pub async fn send_text_message(&self, recipient_identifier: &str, text: &str) -> Result<SentMessage, SdkError> {
         let framed = crate::messaging::encode_text_payload(text);
         self.send_message(recipient_identifier, &framed).await
     }
 
+    /// Encodes and sends a voice audio message (e.g. raw Opus bytes).
+    ///
+    /// Frames the audio data with the `0x01` discriminator byte before end-to-end encryption.
     pub async fn send_voice_message(&self, recipient_identifier: &str, audio_bytes: &[u8]) -> Result<SentMessage, SdkError> {
         let framed = crate::messaging::encode_voice_payload(audio_bytes);
         self.send_message(recipient_identifier, &framed).await
     }
 
+    /// Encodes and sends an image message with current system timestamp and optional caption.
+    ///
+    /// Frames the image with the `0x02` discriminator byte, 4-byte big-endian timestamp,
+    /// 2-byte big-endian caption length, caption bytes, and raw image bytes.
     pub async fn send_image_message(
         &self,
         recipient_identifier: &str,
@@ -323,6 +372,7 @@ impl DeezChatzClient {
         .await
     }
 
+    /// Encodes and sends an image message with an explicit UNIX timestamp (seconds) and optional caption.
     pub async fn send_image_message_with_timestamp(
         &self,
         recipient_identifier: &str,
@@ -335,15 +385,19 @@ impl DeezChatzClient {
         self.send_message(recipient_identifier, &framed).await
     }
 
+    /// Encodes and sends a higher-order [`DecodedPayload`] (Text, Voice, or Image).
     pub async fn send_payload(
         &self,
         recipient_identifier: &str,
-        payload: &crate::messaging::DecodedPayload,
+        payload: &DecodedPayload,
     ) -> Result<SentMessage, SdkError> {
         let framed = payload.encode();
         self.send_message(recipient_identifier, &framed).await
     }
 
+    /// Fetches public profile and identity information for a user without consuming an OPK.
+    ///
+    /// Uses `GET /bundle/sync/{target_user_id}` signed with the client's Identity Key.
     pub async fn get_sync_bundle(&self, target_user_id: &str) -> Result<SyncBundleResponse, SdkError> {
         let user_id = self.user_id.as_ref().ok_or_else(|| SdkError::InvalidOperation("User ID not set".into()))?;
         let spk = self.keystore.get_signed_pre_key(1).await?.ok_or_else(|| SdkError::Storage("Missing SPK".into()))?;
@@ -351,6 +405,10 @@ impl DeezChatzClient {
         self.api.get_sync_bundle(user_id, &spk.0, target_user_id).await
     }
 
+    /// Gracefully disconnects the MQTT transport.
+    ///
+    /// Waits up to 5 seconds for any pending in-flight messages to receive `PUBACK` from the
+    /// broker before terminating the connection, preventing dropped outbound messages.
     pub async fn disconnect(&mut self) -> Result<(), SdkError> {
         if let Some(mqtt) = &self.mqtt {
             mqtt.disconnect().await?;

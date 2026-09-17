@@ -55,16 +55,6 @@ pub fn build_google_auth_url(
 }
 
 // ---------------------------------------------------------------------------
-// Google OAuth API Requests & Structs
-// ---------------------------------------------------------------------------
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct GoogleIdTokenRequest<'a> {
-    id_token: &'a str,
-    i_key: String,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OAuthRegisterRequest<'a> {
@@ -84,28 +74,6 @@ pub struct GoogleRegisterResponse {
     pub email: Option<String>,
     pub name: Option<String>,
     pub picture: Option<String>,
-}
-
-/// Phase 1 Registration via Google OAuth ID Token (`POST /register/google/id_token`)
-pub async fn register_google(
-    http_client: &HttpClient,
-    base_url: &str,
-    id_token: &str,
-    i_key_pub: &[u8; 33],
-) -> Result<GoogleRegisterResponse, SdkError> {
-    let url = format!("{}/register/google/id_token", base_url);
-    let req_body = GoogleIdTokenRequest {
-        id_token,
-        i_key: STANDARD.encode(i_key_pub),
-    };
-
-    let res = http_client.post(&url).json(&req_body).send().await?;
-    if !res.status().is_success() {
-        let err = res.text().await.unwrap_or_default();
-        return Err(SdkError::Api(format!("Google ID token registration failed: {}", err)));
-    }
-
-    Ok(res.json().await?)
 }
 
 /// Phase 1 Registration via PKCE Authorization Code (`POST /register/google/pkce`)
