@@ -1,4 +1,11 @@
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use crate::error::SdkError;
+
+// ---------------------------------------------------------------------------
+// Payload Encoding & Decoding
+// ---------------------------------------------------------------------------
 
 /// Discriminator byte for UTF-8 text messages.
 pub const PAYLOAD_TYPE_TEXT: u8 = 0;
@@ -95,9 +102,6 @@ pub fn encode_image_payload(timestamp_seconds: u32, caption: &str, image_bytes: 
 }
 
 /// Decodes a framed binary payload by inspecting its first discriminator byte.
-///
-/// Returns an error if the payload is empty, if the header or caption is truncated,
-/// or if an unrecognized type byte is encountered.
 pub fn decode_payload(bytes: &[u8]) -> Result<DecodedPayload, PayloadError> {
     if bytes.is_empty() {
         return Err(PayloadError::EmptyPayload);
@@ -136,6 +140,87 @@ pub fn decode_payload(bytes: &[u8]) -> Result<DecodedPayload, PayloadError> {
         }
         other => Err(PayloadError::UnrecognizedType(other)),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Storage Traits and Models
+// ---------------------------------------------------------------------------
+
+/// Represents an abstract storage backend for cryptographic keys.
+#[async_trait]
+pub trait KeyStore: Send + Sync {
+    async fn save_identity_key(&self, private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<(), SdkError>;
+    async fn get_identity_key(&self) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
+    async fn save_signed_pre_key(&self, id: u32, private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<(), SdkError>;
+    async fn get_signed_pre_key(&self, id: u32) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
+    async fn save_one_time_pre_keys(&self, keys: Vec<(u32, [u8; 32], [u8; 33])>) -> Result<(), SdkError>;
+    async fn consume_one_time_pre_key(&self, id: u32) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
+}
+
+/// Represents an abstract storage backend for Signal Protocol sessions.
+#[async_trait]
+pub trait SessionStore: Send + Sync {
+    async fn save_session(&self, recipient_id: &str, session_data: &[u8]) -> Result<(), SdkError>;
+    async fn get_session(&self, recipient_id: &str) -> Result<Option<Vec<u8>>, SdkError>;
+    async fn delete_session(&self, recipient_id: &str) -> Result<(), SdkError>;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageStatus {
+    Pending,
+    Processed,
+    Sent,
+    Failed,
+}
+
+/// Represents a persistent entry in the raw incoming MQTT Inbox.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InboxEntry {
+    pub id: i64,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub received_at: u64,
+    pub status: MessageStatus,
+    pub retry_count: u32,
+    pub processed_at: Option<u64>,
+}
+
+/// Abstract storage backend for the incoming message Inbox queue.
+#[async_trait]
+pub trait InboxStore: Send + Sync {
+    async fn save_to_inbox(&self, topic: &str, payload: &[u8]) -> Result<i64, SdkError>;
+    async fn mark_inbox_processed(&self, id: i64) -> Result<(), SdkError>;
+    async fn mark_inbox_failed(&self, id: i64, error: &str) -> Result<(), SdkError>;
+    async fn get_pending_inbox(&self) -> Result<Vec<InboxEntry>, SdkError>;
+}
+
+/// Represents a persistent entry in the outgoing MQTT Outbox.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OutboxEntry {
+    pub id: i64,
+    pub recipient_id: String,
+    pub message_id: String,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub created_at: u64,
+    pub status: MessageStatus,
+    pub retry_count: u32,
+    pub sent_at: Option<u64>,
+}
+
+/// Abstract storage backend for the outgoing message Outbox queue.
+#[async_trait]
+pub trait OutboxStore: Send + Sync {
+    async fn save_to_outbox(
+        &self,
+        recipient_id: &str,
+        message_id: &str,
+        topic: &str,
+        payload: &[u8],
+    ) -> Result<i64, SdkError>;
+    async fn mark_outbox_sent(&self, id: i64) -> Result<(), SdkError>;
+    async fn mark_outbox_failed(&self, id: i64, error: &str) -> Result<(), SdkError>;
+    async fn get_pending_outbox(&self) -> Result<Vec<OutboxEntry>, SdkError>;
 }
 
 #[cfg(test)]

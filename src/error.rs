@@ -22,5 +22,5 @@ pub enum SdkError {
     InvalidOperation(String),
 
     #[error("Payload error: {0}")]
-    Payload(#[from] crate::payload::PayloadError),
+    Payload(#[from] crate::messaging::PayloadError),
 }

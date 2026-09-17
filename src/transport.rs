@@ -1,10 +1,183 @@
+use reqwest::{Client as HttpClient, header::{HeaderMap, HeaderValue}};
+use serde::{Deserialize, Serialize};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rumqttc::{AsyncClient, MqttOptions, QoS, Event as MqttEvent, Incoming, Transport};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+
 use crate::error::SdkError;
-use crate::crypto::sign_payload;
-use crate::store::{InboxStore, OutboxStore, SessionStore, KeyStore};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::crypto::{generate_auth_headers, sign_payload, decrypt_message};
+use crate::messaging::{InboxStore, OutboxStore, SessionStore, KeyStore};
+
+// ---------------------------------------------------------------------------
+// HTTP API Client
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct ApiClient {
+    pub client: HttpClient,
+    pub base_url: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeviceRegisterRequest {
+    state: String,
+    state_signature: String,
+    state_vrf: String,
+    phone: String,
+    signed_pre_key: String,
+    pre_key_sign: String,
+    pre_key_vrf: String,
+    opks: Vec<String>,
+    signed_device_key: String,
+    dev_key_sign: String,
+    dev_key_vrf: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DeviceRegisterResponse {
+    pub status: String,
+    pub user_id: String,
+    pub device_id: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct BundleResponse {
+    pub user_id: String,
+    pub device_id: String,
+    pub identity_key: String,
+    pub signed_pre_key: String,
+    pub signature: String,
+    pub opk: Option<OpkResponse>,
+    pub phone: Option<String>,
+    pub picture: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct OpkResponse {
+    pub id: u32,
+    pub key: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncBundleResponse {
+    pub user_id: String,
+    pub identity_key: String,
+    pub picture: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl ApiClient {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            client: HttpClient::new(),
+            base_url,
+        }
+    }
+
+    /// Helper to attach stateless signature authentication headers.
+    fn auth_headers(&self, user_id: &str, signing_private_key: &[u8; 32]) -> Result<HeaderMap, SdkError> {
+        let (uid, ts, sig, vrf) = generate_auth_headers(user_id, signing_private_key)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-User-Id", HeaderValue::from_str(&uid).map_err(|e| SdkError::Api(e.to_string()))?);
+        headers.insert("X-Timestamp", HeaderValue::from_str(&ts).map_err(|e| SdkError::Api(e.to_string()))?);
+        headers.insert("X-Signature", HeaderValue::from_str(&sig).map_err(|e| SdkError::Api(e.to_string()))?);
+        headers.insert("X-Vrf", HeaderValue::from_str(&vrf).map_err(|e| SdkError::Api(e.to_string()))?);
+        Ok(headers)
+    }
+
+    /// Phase 2 Registration: Device registration with signed keys (`POST /register/device`)
+    pub async fn register_device(
+        &self,
+        state: &str,
+        phone: &str,
+        identity_private: &[u8; 32],
+        signed_pre_key_pub: &[u8; 33],
+        signed_device_key_pub: &[u8; 33],
+        opks_pub: &[[u8; 33]],
+    ) -> Result<DeviceRegisterResponse, SdkError> {
+        let url = format!("{}/register/device", self.base_url);
+
+        let (state_signature, state_vrf) = sign_payload(identity_private, state.as_bytes())?;
+        
+        let spk_b64 = STANDARD.encode(signed_pre_key_pub);
+        let (pre_key_sign, pre_key_vrf) = sign_payload(identity_private, signed_pre_key_pub)?;
+
+        let sdk_b64 = STANDARD.encode(signed_device_key_pub);
+        let (dev_key_sign, dev_key_vrf) = sign_payload(identity_private, signed_device_key_pub)?;
+
+        let opks_b64: Vec<String> = opks_pub.iter().map(|k| STANDARD.encode(k)).collect();
+
+        let req_body = DeviceRegisterRequest {
+            state: state.to_string(),
+            state_signature,
+            state_vrf,
+            phone: phone.to_string(),
+            signed_pre_key: spk_b64,
+            pre_key_sign,
+            pre_key_vrf,
+            opks: opks_b64,
+            signed_device_key: sdk_b64,
+            dev_key_sign,
+            dev_key_vrf,
+        };
+
+        let res = self.client.post(&url).json(&req_body).send().await?;
+        if !res.status().is_success() {
+            let err = res.text().await.unwrap_or_default();
+            return Err(SdkError::Api(format!("Device registration failed: {}", err)));
+        }
+
+        Ok(res.json().await?)
+    }
+
+    /// Fetch a pre-key bundle for a contact (`POST /bundle/{identifier}`)
+    /// Atomically consumes one One-Time Pre-Key (OPK).
+    pub async fn get_bundle(
+        &self,
+        user_id: &str,
+        signing_private_key: &[u8; 32],
+        identifier: &str,
+    ) -> Result<BundleResponse, SdkError> {
+        let url = format!("{}/bundle/{}", self.base_url, urlencoding::encode(identifier));
+        let headers = self.auth_headers(user_id, signing_private_key)?;
+
+        let res = self.client.post(&url).headers(headers).send().await?;
+        if !res.status().is_success() {
+            let err = res.text().await.unwrap_or_default();
+            return Err(SdkError::Api(format!("Failed to fetch bundle: {}", err)));
+        }
+
+        Ok(res.json().await?)
+    }
+
+    /// Fetch read-only contact identity and profile without popping an OPK (`GET /bundle/sync/{userId}`)
+    pub async fn get_sync_bundle(
+        &self,
+        user_id: &str,
+        signing_private_key: &[u8; 32],
+        target_user_id: &str,
+    ) -> Result<SyncBundleResponse, SdkError> {
+        let url = format!("{}/bundle/sync/{}", self.base_url, urlencoding::encode(target_user_id));
+        let headers = self.auth_headers(user_id, signing_private_key)?;
+
+        let res = self.client.get(&url).headers(headers).send().await?;
+        if !res.status().is_success() {
+            let err = res.text().await.unwrap_or_default();
+            return Err(SdkError::Api(format!("Failed to fetch sync bundle: {}", err)));
+        }
+
+        Ok(res.json().await?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MQTT Real-Time Transport
+// ---------------------------------------------------------------------------
 
 /// Real-time events emitted by the SDK
 #[derive(Debug, Clone)]
@@ -20,99 +193,6 @@ pub enum Event {
 pub struct MqttService {
     client: AsyncClient,
     outbox_store: Arc<dyn OutboxStore>,
-}
-
-async fn decrypt_message(
-    payload_bytes: &[u8],
-    sender_id: &str,
-    sessions: &Arc<dyn SessionStore>,
-    keystore: &Arc<dyn KeyStore>,
-) -> Result<Vec<u8>, SdkError> {
-    use crate::crypto::{EncryptedPayload, ActiveSession, construct_ad, decode_b64_33};
-    use libsignal_dezire::x3dh::{x3dh_responder};
-    use libsignal_dezire::ratchet::{init_receiver_state, decrypt as ratchet_decrypt};
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-
-    let enc_payload: EncryptedPayload = serde_json::from_slice(payload_bytes)
-        .map_err(|e| SdkError::Crypto(format!("Invalid payload json: {}", e)))?;
-
-    // If the payload carries X3DH handshake fields (identity_key + ephemeral_key) it is
-    // always a fresh session initiation — even when a prior session exists in storage.
-    // This handles re-registration / app reinstall on the remote side.
-    let is_initial = enc_payload.identity_key.is_some() && enc_payload.ephemeral_key.is_some();
-
-    let mut active_session: ActiveSession;
-
-    if is_initial {
-        // Always perform X3DH when the sender explicitly starts a new session
-        let ik_b64 = enc_payload.identity_key.as_ref().unwrap();
-        let ek_b64 = enc_payload.ephemeral_key.as_ref().unwrap();
-
-        let sender_identity_pub = decode_b64_33(ik_b64)?;
-        let sender_ephemeral_pub = decode_b64_33(ek_b64)?;
-        let spk_id = enc_payload.spk_id.unwrap_or(1);
-        let opk_id = enc_payload.opk_id;
-
-        let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
-        let local_spk = keystore.get_signed_pre_key(spk_id).await?.ok_or_else(|| SdkError::Storage("SPK missing".into()))?;
-
-        let opk_private = if let Some(oid) = opk_id {
-            if let Some(k) = keystore.consume_one_time_pre_key(oid).await? {
-                Some(k.0)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let shared_secret = x3dh_responder(
-            &local_id_key.0,
-            &local_spk.0,
-            opk_private.as_ref(),
-            &sender_identity_pub,
-            &sender_ephemeral_pub,
-        ).map_err(|e| SdkError::Crypto(format!("X3DH responder failed: {:?}", e)))?;
-
-        use libsignal_dezire::utils::decode_public_key;
-        use libsignal_dezire::ratchet::{DhPublicKey, DhPrivateKey};
-
-        let spk_priv = DhPrivateKey::from(local_spk.0);
-        let spk_pub_bytes = decode_public_key(&local_spk.1).map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
-        let spk_pub = DhPublicKey::from(spk_pub_bytes);
-
-        let ratchet_state = init_receiver_state(shared_secret, (spk_priv, spk_pub));
-
-        active_session = ActiveSession {
-            ratchet_state,
-            remote_identity_pub: sender_identity_pub.to_vec(),
-            remote_user_id: sender_id.to_string(),
-            remote_device_id: String::new(),
-        };
-    } else if let Some(bytes) = sessions.get_session(sender_id).await? {
-        // Subsequent message — use the existing ratchet state
-        active_session = serde_json::from_slice(&bytes)
-            .map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?;
-    } else {
-        return Err(SdkError::Crypto("No session found and message is not an X3DH initial".into()));
-    }
-
-    let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
-    let ad = construct_ad(&active_session.remote_identity_pub, &local_id_key.1);
-
-    let header_bytes = STANDARD.decode(&enc_payload.header)
-        .map_err(|e| SdkError::Crypto(format!("Invalid header base64: {}", e)))?;
-    let ciphertext_bytes = STANDARD.decode(&enc_payload.ciphertext)
-        .map_err(|e| SdkError::Crypto(format!("Invalid ciphertext base64: {}", e)))?;
-
-    let plaintext = ratchet_decrypt(&mut active_session.ratchet_state, &header_bytes, &ciphertext_bytes, &ad)
-        .map_err(|e| SdkError::Crypto(format!("Ratchet decrypt failed: {:?}", e)))?;
-
-    let session_bytes = serde_json::to_vec(&active_session)
-        .map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;
-    sessions.save_session(sender_id, &session_bytes).await?;
-
-    Ok(plaintext)
 }
 
 fn generate_mqtt_password(user_id: &str, signing_key: &[u8; 32]) -> Result<String, SdkError> {
@@ -227,7 +307,6 @@ impl MqttService {
                         let _ = event_sender.send(Event::Disconnected).await;
                         tokio::time::sleep(Duration::from_secs(3)).await;
 
-                        // Refresh credentials with a fresh timestamp and signature before reconnecting
                         if let Ok(new_password) = generate_mqtt_password(&uid, &spk_priv) {
                             eventloop.mqtt_options.set_credentials(&uid, new_password);
                         }
@@ -269,7 +348,6 @@ mod tests {
         let keypair = gen_keypair();
         let user_id = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
         let password = generate_mqtt_password(user_id, &keypair.secret).expect("failed to generate password");
-        // 128 (signature base64) + 44 (vrf base64) + 10 (unix timestamp) = 182 characters
         assert_eq!(password.len(), 182);
 
         let sig_b64 = &password[..128];
@@ -280,7 +358,6 @@ mod tests {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         assert!(now.abs_diff(ts) <= 2);
 
-        // Verify that signature is valid with the public key
         use base64::{Engine as _, engine::general_purpose::STANDARD};
         use libsignal_dezire::vxeddsa::vxeddsa_verify;
 
@@ -304,5 +381,3 @@ mod tests {
         }
     }
 }
-
-
