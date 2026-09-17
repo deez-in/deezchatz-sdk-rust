@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use rumqttc::{AsyncClient, MqttOptions, QoS, Event as MqttEvent, Incoming, Transport};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::error::SdkError;
 use crate::crypto::{generate_auth_headers, sign_payload, decrypt_message};
@@ -193,6 +194,7 @@ pub enum Event {
 pub struct MqttService {
     client: AsyncClient,
     outbox_store: Arc<dyn OutboxStore>,
+    inflight_messages: Arc<AtomicUsize>,
 }
 
 fn generate_mqtt_password(user_id: &str, signing_key: &[u8; 32]) -> Result<String, SdkError> {
@@ -243,6 +245,8 @@ impl MqttService {
         let sessions = session_store.clone();
         let keystore_clone = keystore.clone();
         let spk_priv = *signed_pre_key_private;
+        let inflight_messages = Arc::new(AtomicUsize::new(0));
+        let inflight_clone = inflight_messages.clone();
 
         tokio::spawn(async move {
             loop {
@@ -311,6 +315,15 @@ impl MqttService {
                             eventloop.mqtt_options.set_credentials(&uid, new_password);
                         }
                     }
+                    Ok(MqttEvent::Incoming(Incoming::PubAck(_))) => {
+                        let mut current = inflight_clone.load(Ordering::SeqCst);
+                        while current > 0 {
+                            match inflight_clone.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                                Ok(_) => break,
+                                Err(x) => current = x,
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -319,11 +332,13 @@ impl MqttService {
         Ok(Self {
             client,
             outbox_store,
+            inflight_messages,
         })
     }
 
     /// Publishes a payload and marks it sent in the persistent outbox on success.
     pub async fn send_payload(&self, outbox_id: i64, topic: &str, ciphertext: Vec<u8>) -> Result<(), SdkError> {
+        self.inflight_messages.fetch_add(1, Ordering::SeqCst);
         let res = self.client.publish(topic, QoS::AtLeastOnce, false, ciphertext).await;
         match res {
             Ok(_) => {
@@ -331,10 +346,30 @@ impl MqttService {
                 Ok(())
             }
             Err(e) => {
+                let mut current = self.inflight_messages.load(Ordering::SeqCst);
+                while current > 0 {
+                    match self.inflight_messages.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(x) => current = x,
+                    }
+                }
                 let _ = self.outbox_store.mark_outbox_failed(outbox_id, &e.to_string()).await;
                 Err(SdkError::Mqtt(e.to_string()))
             }
         }
+    }
+
+    pub async fn disconnect(&self) -> Result<(), SdkError> {
+        let start = tokio::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(5);
+        while self.inflight_messages.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= timeout {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        self.client.disconnect().await.map_err(|e| SdkError::Mqtt(e.to_string()))?;
+        Ok(())
     }
 }
 

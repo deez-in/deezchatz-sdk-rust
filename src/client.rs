@@ -350,4 +350,12 @@ impl DeezChatzClient {
 
         self.api.get_sync_bundle(user_id, &spk.0, target_user_id).await
     }
+
+    pub async fn disconnect(&mut self) -> Result<(), SdkError> {
+        if let Some(mqtt) = &self.mqtt {
+            mqtt.disconnect().await?;
+        }
+        self.mqtt = None;
+        Ok(())
+    }
 }
