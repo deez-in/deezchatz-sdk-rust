@@ -321,19 +321,13 @@ let sent = client.send_voice_message("recipient@example.com", &opus_audio_bytes)
 #### Sending Images with Captions
 ```rust
 let jpeg_bytes = std::fs::read("photo.jpg")?;
-// Sends image with current timestamp and caption
 let sent = client.send_image_message("recipient@example.com", &jpeg_bytes, Some("Sunset at the beach 🌅")).await?;
-
-// Or specify explicit UNIX timestamp
-let sent = client.send_image_message_with_timestamp("recipient@example.com", &jpeg_bytes, Some("Sunset"), 1726030464).await?;
 ```
 
-#### Sending DecodedPayload Directly
+#### Sending Custom or Encoded Payloads
 ```rust
-use deezchatz_sdk_rust::DecodedPayload;
-
-let payload = DecodedPayload::Text { text: "Reusable payload".into() };
-client.send_payload("recipient@example.com", &payload).await?;
+let payload_bytes = payload.encode();
+client.send_message("recipient@example.com", &payload_bytes).await?;
 ```
 
 ---
@@ -402,8 +396,6 @@ assert_eq!(payload, DecodedPayload::Text { text: "Hello!".to_string() });
 | `send_text_message(recipient, text)` | X3DH / Double Ratchet + MQTT | Encodes text (`0x00`) and sends end-to-end encrypted message |
 | `send_voice_message(recipient, audio)` | X3DH / Double Ratchet + MQTT | Encodes voice (`0x01`) and sends end-to-end encrypted message |
 | `send_image_message(recipient, image, caption)` | X3DH / Double Ratchet + MQTT | Encodes image (`0x02`) with current timestamp and optional caption |
-| `send_image_message_with_timestamp(recipient, image, caption, ts)` | X3DH / Double Ratchet + MQTT | Encodes image (`0x02`) with custom timestamp and caption |
-| `send_payload(recipient, &DecodedPayload)` | X3DH / Double Ratchet + MQTT | Encodes a `DecodedPayload` enum and sends encrypted |
 | `send_message(recipient, payload_bytes)` | X3DH / Double Ratchet + MQTT | Sends raw binary payload end-to-end encrypted |
 | `get_sync_bundle(target_user_id)` | `GET /bundle/sync/{userId}` | Read-only profile and identity key lookup without consuming OPKs |
 | `disconnect()` | MQTT Client | Waits for in-flight PUBACKs and gracefully terminates connection |

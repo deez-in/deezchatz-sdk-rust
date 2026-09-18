@@ -1,7 +1,7 @@
 use crate::transport::{ApiClient, SyncBundleResponse, Event, MqttService};
 use crate::crypto::{generate_registration_keys, RegistrationKeys, encrypt_message, parse_prekey_bundle};
 use crate::error::SdkError;
-use crate::messaging::{DecodedPayload, InboxStore, KeyStore, OutboxStore, SessionStore};
+use crate::messaging::{InboxStore, KeyStore, OutboxStore, SessionStore};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -363,35 +363,8 @@ impl DeezChatzClient {
             .map_err(|e| SdkError::InvalidOperation(format!("System time error: {}", e)))?
             .as_secs() as u32;
 
-        self.send_image_message_with_timestamp(
-            recipient_identifier,
-            image_bytes,
-            caption,
-            timestamp_seconds,
-        )
-        .await
-    }
-
-    /// Encodes and sends an image message with an explicit UNIX timestamp (seconds) and optional caption.
-    pub async fn send_image_message_with_timestamp(
-        &self,
-        recipient_identifier: &str,
-        image_bytes: &[u8],
-        caption: Option<&str>,
-        timestamp_seconds: u32,
-    ) -> Result<SentMessage, SdkError> {
         let caption_str = caption.unwrap_or("");
         let framed = crate::messaging::encode_image_payload(timestamp_seconds, caption_str, image_bytes);
-        self.send_message(recipient_identifier, &framed).await
-    }
-
-    /// Encodes and sends a higher-order [`DecodedPayload`] (Text, Voice, or Image).
-    pub async fn send_payload(
-        &self,
-        recipient_identifier: &str,
-        payload: &DecodedPayload,
-    ) -> Result<SentMessage, SdkError> {
-        let framed = payload.encode();
         self.send_message(recipient_identifier, &framed).await
     }
 
