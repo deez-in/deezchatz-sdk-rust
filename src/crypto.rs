@@ -1,5 +1,5 @@
-use libsignal_dezire::vxeddsa::{gen_keypair, vxeddsa_sign, KeyPair};
 use crate::error::SdkError;
+use libsignal_dezire::vxeddsa::{gen_keypair, vxeddsa_sign, KeyPair};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// A bundle of generated keys ready for registration.
@@ -36,14 +36,16 @@ pub fn generate_registration_keys(opk_count: u32) -> RegistrationKeys {
 }
 
 /// Helper to sign payloads using the signing key (for REST authentication).
-pub fn sign_payload(signing_private_key: &[u8; 32], payload: &[u8]) -> Result<(String, String), SdkError> {
-    let out = vxeddsa_sign(signing_private_key, payload)
-        .map_err(|_| SdkError::Crypto("Failed to sign payload".to_string()))?;
-    
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let sig_b64 = STANDARD.encode(&out.signature);
-    let vrf_b64 = STANDARD.encode(&out.vrf);
-    
+pub fn sign_payload(
+    signing_private_key: &[u8; 32],
+    payload: &[u8],
+) -> Result<(String, String), SdkError> {
+    let out = vxeddsa_sign(signing_private_key, payload)?;
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let sig_b64 = STANDARD.encode(out.signature);
+    let vrf_b64 = STANDARD.encode(out.vrf);
+
     Ok((sig_b64, vrf_b64))
 }
 
@@ -64,8 +66,8 @@ pub fn generate_auth_headers(
     Ok((user_id.to_string(), timestamp, signature, vrf))
 }
 
-use serde::{Deserialize, Serialize};
 use libsignal_dezire::ratchet::RatchetState;
+use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -100,10 +102,20 @@ pub fn construct_ad(sender_id_pub: &[u8], receiver_id_pub: &[u8]) -> Vec<u8> {
 
 /// Helper to decode base64 strings into fixed size arrays
 pub fn decode_b64_33(b64: &str) -> Result<[u8; 33], SdkError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let bytes = STANDARD.decode(b64).map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = STANDARD
+        .decode(b64)
+        .map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
     if bytes.len() != 33 {
-        return Err(SdkError::Crypto(format!("Invalid key length: {}", bytes.len())));
+        return Err(SdkError::Crypto(format!(
+            "Invalid key length: {}",
+            bytes.len()
+        )));
+    }
+    if bytes[0] != 0x05 {
+        return Err(SdkError::Crypto(
+            "Invalid public key prefix, expected 0x05".to_string(),
+        ));
     }
     let mut out = [0u8; 33];
     out.copy_from_slice(&bytes);
@@ -111,10 +123,15 @@ pub fn decode_b64_33(b64: &str) -> Result<[u8; 33], SdkError> {
 }
 
 pub fn decode_b64_96(b64: &str) -> Result<[u8; 96], SdkError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    let bytes = STANDARD.decode(b64).map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = STANDARD
+        .decode(b64)
+        .map_err(|e| SdkError::Crypto(format!("Base64 decode error: {}", e)))?;
     if bytes.len() != 96 {
-        return Err(SdkError::Crypto(format!("Invalid sig length: {}", bytes.len())));
+        return Err(SdkError::Crypto(format!(
+            "Invalid sig length: {}",
+            bytes.len()
+        )));
     }
     let mut out = [0u8; 96];
     out.copy_from_slice(&bytes);
@@ -125,10 +142,15 @@ pub fn decode_b64_96(b64: &str) -> Result<[u8; 96], SdkError> {
 // High-Level Encryption and Decryption
 // ---------------------------------------------------------------------------
 
-use libsignal_dezire::x3dh::{PreKeyBundle, SignedPreKey, OneTimePreKey, x3dh_initiator, x3dh_responder};
-use libsignal_dezire::ratchet::{init_sender_state, init_receiver_state, encrypt as ratchet_encrypt, decrypt as ratchet_decrypt, DhPublicKey, DhPrivateKey};
+use crate::messaging::{KeyStore, SessionStore};
+use libsignal_dezire::ratchet::{
+    decrypt as ratchet_decrypt, encrypt as ratchet_encrypt, init_receiver_state, init_sender_state,
+    DhPrivateKey, DhPublicKey,
+};
 use libsignal_dezire::utils::decode_public_key;
-use crate::messaging::{SessionStore, KeyStore};
+use libsignal_dezire::x3dh::{
+    x3dh_initiator, x3dh_responder, OneTimePreKey, PreKeyBundle, SignedPreKey,
+};
 use std::sync::Arc;
 
 pub fn parse_prekey_bundle(
@@ -166,19 +188,19 @@ pub fn encrypt_message(
     existing_session: Option<ActiveSession>,
     prekey_bundle_opt: Option<(String, String, PreKeyBundle)>,
 ) -> Result<(EncryptedPayload, ActiveSession), SdkError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
-    
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+
     let mut active_session;
     let mut x3dh_init_data = None;
 
     if let Some(session) = existing_session {
         active_session = session;
     } else {
-        let (recipient_id, recipient_device_id, bundle) = prekey_bundle_opt
-            .ok_or_else(|| SdkError::Crypto("No existing session and no prekey bundle provided".into()))?;
+        let (recipient_id, recipient_device_id, bundle) = prekey_bundle_opt.ok_or_else(|| {
+            SdkError::Crypto("No existing session and no prekey bundle provided".into())
+        })?;
 
-        let init_result = x3dh_initiator(&id_key.0, &bundle)
-            .map_err(|e| SdkError::Crypto(format!("X3DH init failed: {:?}", e)))?;
+        let init_result = x3dh_initiator(&id_key.0, &bundle)?;
 
         let spk_pub_bytes = decode_public_key(&bundle.signed_prekey.public_key)
             .map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
@@ -195,16 +217,17 @@ pub fn encrypt_message(
         };
 
         x3dh_init_data = Some((
-            STANDARD.encode(&id_key.1),
-            STANDARD.encode(&init_result.ephemeral_public),
+            STANDARD.encode(id_key.1),
+            STANDARD.encode(init_result.ephemeral_public),
             bundle.one_time_prekey.map(|o| o.id),
         ));
     }
 
     let ad = construct_ad(&id_key.1, &active_session.remote_identity_pub);
 
-    let (enc_header, ciphertext_bytes) = ratchet_encrypt(&mut active_session.ratchet_state, payload, &ad)
-        .map_err(|e| SdkError::Crypto(format!("Ratchet encrypt failed: {:?}", e)))?;
+    let (enc_header, ciphertext_bytes) =
+        ratchet_encrypt(&mut active_session.ratchet_state, payload, &ad)
+            .map_err(|e| SdkError::Crypto(format!("Ratchet encrypt failed: {:?}", e)))?;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -237,7 +260,7 @@ pub async fn decrypt_message(
     sessions: &Arc<dyn SessionStore>,
     keystore: &Arc<dyn KeyStore>,
 ) -> Result<Vec<u8>, SdkError> {
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
 
     let enc_payload: EncryptedPayload = serde_json::from_slice(payload_bytes)
         .map_err(|e| SdkError::Crypto(format!("Invalid payload json: {}", e)))?;
@@ -255,15 +278,17 @@ pub async fn decrypt_message(
         let spk_id = enc_payload.spk_id.unwrap_or(1);
         let opk_id = enc_payload.opk_id;
 
-        let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
-        let local_spk = keystore.get_signed_pre_key(spk_id).await?.ok_or_else(|| SdkError::Storage("SPK missing".into()))?;
+        let local_id_key = keystore
+            .get_identity_key()
+            .await?
+            .ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
+        let local_spk = keystore
+            .get_signed_pre_key(spk_id)
+            .await?
+            .ok_or_else(|| SdkError::Storage("SPK missing".into()))?;
 
         let opk_private = if let Some(oid) = opk_id {
-            if let Some(k) = keystore.consume_one_time_pre_key(oid).await? {
-                Some(k.0)
-            } else {
-                None
-            }
+            keystore.consume_one_time_pre_key(oid).await?.map(|k| k.0)
         } else {
             None
         };
@@ -274,10 +299,11 @@ pub async fn decrypt_message(
             opk_private.as_ref(),
             &sender_identity_pub,
             &sender_ephemeral_pub,
-        ).map_err(|e| SdkError::Crypto(format!("X3DH responder failed: {:?}", e)))?;
+        )?;
 
         let spk_priv = DhPrivateKey::from(local_spk.0);
-        let spk_pub_bytes = decode_public_key(&local_spk.1).map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
+        let spk_pub_bytes = decode_public_key(&local_spk.1)
+            .map_err(|_| SdkError::Crypto("Invalid SPK pub".into()))?;
         let spk_pub = DhPublicKey::from(spk_pub_bytes);
 
         let ratchet_state = init_receiver_state(shared_secret, (spk_priv, spk_pub));
@@ -292,19 +318,31 @@ pub async fn decrypt_message(
         active_session = serde_json::from_slice(&bytes)
             .map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?;
     } else {
-        return Err(SdkError::Crypto("No session found and message is not an X3DH initial".into()));
+        return Err(SdkError::Crypto(
+            "No session found and message is not an X3DH initial".into(),
+        ));
     }
 
-    let local_id_key = keystore.get_identity_key().await?.ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
+    let local_id_key = keystore
+        .get_identity_key()
+        .await?
+        .ok_or_else(|| SdkError::Storage("Identity key missing".into()))?;
     let ad = construct_ad(&active_session.remote_identity_pub, &local_id_key.1);
 
-    let header_bytes = STANDARD.decode(&enc_payload.header)
+    let header_bytes = STANDARD
+        .decode(&enc_payload.header)
         .map_err(|e| SdkError::Crypto(format!("Invalid header base64: {}", e)))?;
-    let ciphertext_bytes = STANDARD.decode(&enc_payload.ciphertext)
+    let ciphertext_bytes = STANDARD
+        .decode(&enc_payload.ciphertext)
         .map_err(|e| SdkError::Crypto(format!("Invalid ciphertext base64: {}", e)))?;
 
-    let plaintext = ratchet_decrypt(&mut active_session.ratchet_state, &header_bytes, &ciphertext_bytes, &ad)
-        .map_err(|e| SdkError::Crypto(format!("Ratchet decrypt failed: {:?}", e)))?;
+    let plaintext = ratchet_decrypt(
+        &mut active_session.ratchet_state,
+        &header_bytes,
+        &ciphertext_bytes,
+        &ad,
+    )
+    .map_err(|e| SdkError::Crypto(format!("Ratchet decrypt failed: {:?}", e)))?;
 
     let session_bytes = serde_json::to_vec(&active_session)
         .map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;

@@ -1,9 +1,12 @@
-use crate::transport::{ApiClient, SyncBundleResponse, Event, MqttService};
-use crate::crypto::{generate_registration_keys, RegistrationKeys, encrypt_message, parse_prekey_bundle};
+use crate::crypto::{
+    encrypt_message, generate_registration_keys, parse_prekey_bundle, RegistrationKeys,
+};
 use crate::error::SdkError;
 use crate::messaging::{InboxStore, KeyStore, OutboxStore, SessionStore};
+use crate::transport::{ApiClient, Event, MqttConfig, MqttService, SyncBundleResponse};
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use tracing::instrument;
 use uuid::Uuid;
 
 /// Configuration settings for the DeezChatz SDK client.
@@ -62,8 +65,8 @@ impl ClientConfig {
     pub fn from_env() -> Self {
         let rest_url = std::env::var("DEEZCHATZ_API_URL")
             .unwrap_or_else(|_| "https://api.chatz.deez.in".to_string());
-        let mqtt_url = std::env::var("DEEZCHATZ_MQTT_URL")
-            .unwrap_or_else(|_| "mqtt.deez.in".to_string());
+        let mqtt_url =
+            std::env::var("DEEZCHATZ_MQTT_URL").unwrap_or_else(|_| "mqtt.deez.in".to_string());
         let mqtt_port = std::env::var("DEEZCHATZ_MQTT_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
@@ -152,6 +155,7 @@ impl DeezChatzClient {
     /// Generates identity keys, signed pre-keys, and OPKs, completes the OAuth exchange
     /// with the DeezChatz backend, registers the device with cryptographically signed keys,
     /// and saves all generated keys to the [`KeyStore`].
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn register_with_pkce(
         &mut self,
         code: &str,
@@ -171,10 +175,11 @@ impl DeezChatzClient {
         )
         .await?;
 
-        self.finalize_registration(&oauth_res.state, phone_number, keys).await
+        self.finalize_registration(&oauth_res.state, phone_number, keys)
+            .await
     }
 
-
+    #[instrument(level = "debug", skip_all, err)]
     async fn finalize_registration(
         &mut self,
         state: &str,
@@ -223,7 +228,12 @@ impl DeezChatzClient {
     /// subscribes to the client's topic (`/deezchatz/{user_id}/{device_id}/#`), starts the
     /// background event loop handling inbox persistence, outbox delivery, and reconnection,
     /// and returns an asynchronous channel receiver for [`Event`]s.
-    pub async fn connect(&mut self, user_id: &str, device_id: &str) -> Result<mpsc::Receiver<Event>, SdkError> {
+    #[instrument(level = "debug", skip_all, err)]
+    pub async fn connect(
+        &mut self,
+        user_id: &str,
+        device_id: &str,
+    ) -> Result<mpsc::Receiver<Event>, SdkError> {
         self.user_id = Some(user_id.to_string());
         self.device_id = Some(device_id.to_string());
 
@@ -235,14 +245,18 @@ impl DeezChatzClient {
 
         let (tx, rx) = mpsc::channel(100);
 
-        let mqtt_service = MqttService::new(
-            &self.config.mqtt_url,
-            self.config.mqtt_port,
-            self.config.use_tls,
+        let mqtt_config = MqttConfig {
+            broker_url: &self.config.mqtt_url,
+            broker_port: self.config.mqtt_port,
+            use_tls: self.config.use_tls,
             user_id,
             device_id,
-            &spk.0,
-            tx,
+            signed_pre_key_private: &spk.0,
+            event_sender: tx,
+        };
+
+        let mqtt_service = MqttService::new(
+            mqtt_config,
             self.sessionstore.clone(),
             self.inboxstore.clone(),
             self.outboxstore.clone(),
@@ -263,15 +277,18 @@ impl DeezChatzClient {
     /// enqueues the encrypted message into [`OutboxStore`], and transmits it via MQTT.
     ///
     /// Returns [`SentMessage`] containing the generated `message_id` and resolved `recipient_user_id`.
-    pub async fn send_message(&self, recipient_identifier: &str, payload: &[u8]) -> Result<SentMessage, SdkError> {
-        let user_id = self
-            .user_id
-            .as_ref()
-            .ok_or_else(|| SdkError::InvalidOperation("User ID not initialized (call connect first)".into()))?;
-        let device_id = self
-            .device_id
-            .as_ref()
-            .ok_or_else(|| SdkError::InvalidOperation("Device ID not initialized (call connect first)".into()))?;
+    #[instrument(level = "debug", skip_all, err)]
+    pub async fn send_message(
+        &self,
+        recipient_identifier: &str,
+        payload: &[u8],
+    ) -> Result<SentMessage, SdkError> {
+        let user_id = self.user_id.as_ref().ok_or_else(|| {
+            SdkError::InvalidOperation("User ID not initialized (call connect first)".into())
+        })?;
+        let device_id = self.device_id.as_ref().ok_or_else(|| {
+            SdkError::InvalidOperation("Device ID not initialized (call connect first)".into())
+        })?;
 
         let id_key = self
             .keystore
@@ -280,36 +297,59 @@ impl DeezChatzClient {
             .ok_or_else(|| SdkError::Storage("Identity key missing from keystore".into()))?;
 
         let existing_session_bytes = self.sessionstore.get_session(recipient_identifier).await?;
-        
+
         let existing_session = match existing_session_bytes {
-            Some(bytes) => Some(serde_json::from_slice(&bytes).map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?),
+            Some(bytes) => Some(
+                serde_json::from_slice(&bytes)
+                    .map_err(|e| SdkError::Storage(format!("Session deserialize error: {}", e)))?,
+            ),
             None => None,
         };
 
         let mut prekey_bundle_opt = None;
 
         if existing_session.is_none() {
-            let spk = self.keystore.get_signed_pre_key(1).await?.ok_or_else(|| SdkError::Storage("Missing SPK for auth".into()))?;
-            let bundle = self.api.get_bundle(user_id, &spk.0, recipient_identifier).await?;
-            
+            let spk = self
+                .keystore
+                .get_signed_pre_key(1)
+                .await?
+                .ok_or_else(|| SdkError::Storage("Missing SPK for auth".into()))?;
+            let bundle = self
+                .api
+                .get_bundle(user_id, &spk.0, recipient_identifier)
+                .await?;
+
             let opk_opt = bundle.opk.as_ref().map(|o| (o.id, o.key.as_str()));
-            let prekey_bundle = parse_prekey_bundle(&bundle.identity_key, &bundle.signed_pre_key, &bundle.signature, opk_opt)?;
-            
+            let prekey_bundle = parse_prekey_bundle(
+                &bundle.identity_key,
+                &bundle.signed_pre_key,
+                &bundle.signature,
+                opk_opt,
+            )?;
+
             prekey_bundle_opt = Some((bundle.user_id, bundle.device_id, prekey_bundle));
         }
 
-        let (enc_payload, updated_session) = encrypt_message(payload, &id_key, existing_session, prekey_bundle_opt)?;
+        let (enc_payload, updated_session) =
+            encrypt_message(payload, &id_key, existing_session, prekey_bundle_opt)?;
 
         let recipient_id = updated_session.remote_user_id.clone();
         let recipient_device_id = updated_session.remote_device_id.clone();
 
-        let session_bytes = serde_json::to_vec(&updated_session).map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;
-        self.sessionstore.save_session(recipient_identifier, &session_bytes).await?;
+        let session_bytes = serde_json::to_vec(&updated_session)
+            .map_err(|e| SdkError::Storage(format!("Session serialize error: {}", e)))?;
+        self.sessionstore
+            .save_session(recipient_identifier, &session_bytes)
+            .await?;
         if recipient_identifier != recipient_id {
-            let _ = self.sessionstore.save_session(&recipient_id, &session_bytes).await;
+            let _ = self
+                .sessionstore
+                .save_session(&recipient_id, &session_bytes)
+                .await;
         }
 
-        let payload_json = serde_json::to_vec(&enc_payload).map_err(|e| SdkError::Crypto(format!("Payload serialize error: {}", e)))?;
+        let payload_json = serde_json::to_vec(&enc_payload)
+            .map_err(|e| SdkError::Crypto(format!("Payload serialize error: {}", e)))?;
         let message_id = Uuid::new_v4().to_string();
         let topic = format!(
             "/deezchatz/{}/{}/{}/{}",
@@ -334,7 +374,11 @@ impl DeezChatzClient {
     /// Encodes and sends a UTF-8 text message.
     ///
     /// Frames the text with the `0x00` discriminator byte before end-to-end encryption.
-    pub async fn send_text_message(&self, recipient_identifier: &str, text: &str) -> Result<SentMessage, SdkError> {
+    pub async fn send_text_message(
+        &self,
+        recipient_identifier: &str,
+        text: &str,
+    ) -> Result<SentMessage, SdkError> {
         let framed = crate::messaging::encode_text_payload(text);
         self.send_message(recipient_identifier, &framed).await
     }
@@ -342,7 +386,11 @@ impl DeezChatzClient {
     /// Encodes and sends a voice audio message (e.g. raw Opus bytes).
     ///
     /// Frames the audio data with the `0x01` discriminator byte before end-to-end encryption.
-    pub async fn send_voice_message(&self, recipient_identifier: &str, audio_bytes: &[u8]) -> Result<SentMessage, SdkError> {
+    pub async fn send_voice_message(
+        &self,
+        recipient_identifier: &str,
+        audio_bytes: &[u8],
+    ) -> Result<SentMessage, SdkError> {
         let framed = crate::messaging::encode_voice_payload(audio_bytes);
         self.send_message(recipient_identifier, &framed).await
     }
@@ -364,24 +412,38 @@ impl DeezChatzClient {
             .as_secs() as u32;
 
         let caption_str = caption.unwrap_or("");
-        let framed = crate::messaging::encode_image_payload(timestamp_seconds, caption_str, image_bytes);
+        let framed =
+            crate::messaging::encode_image_payload(timestamp_seconds, caption_str, image_bytes);
         self.send_message(recipient_identifier, &framed).await
     }
 
     /// Fetches public profile and identity information for a user without consuming an OPK.
     ///
     /// Uses `GET /bundle/sync/{target_user_id}` signed with the client's Identity Key.
-    pub async fn get_sync_bundle(&self, target_user_id: &str) -> Result<SyncBundleResponse, SdkError> {
-        let user_id = self.user_id.as_ref().ok_or_else(|| SdkError::InvalidOperation("User ID not set".into()))?;
-        let spk = self.keystore.get_signed_pre_key(1).await?.ok_or_else(|| SdkError::Storage("Missing SPK".into()))?;
+    pub async fn get_sync_bundle(
+        &self,
+        target_user_id: &str,
+    ) -> Result<SyncBundleResponse, SdkError> {
+        let user_id = self
+            .user_id
+            .as_ref()
+            .ok_or_else(|| SdkError::InvalidOperation("User ID not set".into()))?;
+        let spk = self
+            .keystore
+            .get_signed_pre_key(1)
+            .await?
+            .ok_or_else(|| SdkError::Storage("Missing SPK".into()))?;
 
-        self.api.get_sync_bundle(user_id, &spk.0, target_user_id).await
+        self.api
+            .get_sync_bundle(user_id, &spk.0, target_user_id)
+            .await
     }
 
     /// Gracefully disconnects the MQTT transport.
     ///
     /// Waits up to 5 seconds for any pending in-flight messages to receive `PUBACK` from the
     /// broker before terminating the connection, preventing dropped outbound messages.
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn disconnect(&mut self) -> Result<(), SdkError> {
         if let Some(mqtt) = &self.mqtt {
             mqtt.disconnect().await?;

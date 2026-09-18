@@ -1,14 +1,18 @@
-use reqwest::{Client as HttpClient, header::{HeaderMap, HeaderValue}};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use reqwest::{
+    header::{HeaderMap, HeaderValue},
+    Client as HttpClient,
+};
+use rumqttc::{AsyncClient, Event as MqttEvent, Incoming, MqttOptions, QoS, Transport};
 use serde::{Deserialize, Serialize};
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use rumqttc::{AsyncClient, MqttOptions, QoS, Event as MqttEvent, Incoming, Transport};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::instrument;
 
+use crate::crypto::{decrypt_message, generate_auth_headers, sign_payload};
 use crate::error::SdkError;
-use crate::crypto::{generate_auth_headers, sign_payload, decrypt_message};
-use crate::messaging::{InboxStore, OutboxStore, SessionStore, KeyStore};
+use crate::messaging::{InboxStore, KeyStore, OutboxStore, SessionStore};
 
 // ---------------------------------------------------------------------------
 // HTTP API Client
@@ -81,17 +85,34 @@ impl ApiClient {
     }
 
     /// Helper to attach stateless signature authentication headers.
-    fn auth_headers(&self, user_id: &str, signing_private_key: &[u8; 32]) -> Result<HeaderMap, SdkError> {
+    fn auth_headers(
+        &self,
+        user_id: &str,
+        signing_private_key: &[u8; 32],
+    ) -> Result<HeaderMap, SdkError> {
         let (uid, ts, sig, vrf) = generate_auth_headers(user_id, signing_private_key)?;
         let mut headers = HeaderMap::new();
-        headers.insert("X-User-Id", HeaderValue::from_str(&uid).map_err(|e| SdkError::Api(e.to_string()))?);
-        headers.insert("X-Timestamp", HeaderValue::from_str(&ts).map_err(|e| SdkError::Api(e.to_string()))?);
-        headers.insert("X-Signature", HeaderValue::from_str(&sig).map_err(|e| SdkError::Api(e.to_string()))?);
-        headers.insert("X-Vrf", HeaderValue::from_str(&vrf).map_err(|e| SdkError::Api(e.to_string()))?);
+        headers.insert(
+            "X-User-Id",
+            HeaderValue::from_str(&uid).map_err(|e| SdkError::Api(e.to_string()))?,
+        );
+        headers.insert(
+            "X-Timestamp",
+            HeaderValue::from_str(&ts).map_err(|e| SdkError::Api(e.to_string()))?,
+        );
+        headers.insert(
+            "X-Signature",
+            HeaderValue::from_str(&sig).map_err(|e| SdkError::Api(e.to_string()))?,
+        );
+        headers.insert(
+            "X-Vrf",
+            HeaderValue::from_str(&vrf).map_err(|e| SdkError::Api(e.to_string()))?,
+        );
         Ok(headers)
     }
 
     /// Phase 2 Registration: Device registration with signed keys (`POST /register/device`)
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn register_device(
         &self,
         state: &str,
@@ -104,7 +125,7 @@ impl ApiClient {
         let url = format!("{}/register/device", self.base_url);
 
         let (state_signature, state_vrf) = sign_payload(identity_private, state.as_bytes())?;
-        
+
         let spk_b64 = STANDARD.encode(signed_pre_key_pub);
         let (pre_key_sign, pre_key_vrf) = sign_payload(identity_private, signed_pre_key_pub)?;
 
@@ -130,7 +151,10 @@ impl ApiClient {
         let res = self.client.post(&url).json(&req_body).send().await?;
         if !res.status().is_success() {
             let err = res.text().await.unwrap_or_default();
-            return Err(SdkError::Api(format!("Device registration failed: {}", err)));
+            return Err(SdkError::Api(format!(
+                "Device registration failed: {}",
+                err
+            )));
         }
 
         Ok(res.json().await?)
@@ -138,13 +162,18 @@ impl ApiClient {
 
     /// Fetch a pre-key bundle for a contact (`POST /bundle/{identifier}`)
     /// Atomically consumes one One-Time Pre-Key (OPK).
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn get_bundle(
         &self,
         user_id: &str,
         signing_private_key: &[u8; 32],
         identifier: &str,
     ) -> Result<BundleResponse, SdkError> {
-        let url = format!("{}/bundle/{}", self.base_url, urlencoding::encode(identifier));
+        let url = format!(
+            "{}/bundle/{}",
+            self.base_url,
+            urlencoding::encode(identifier)
+        );
         let headers = self.auth_headers(user_id, signing_private_key)?;
 
         let res = self.client.post(&url).headers(headers).send().await?;
@@ -157,19 +186,27 @@ impl ApiClient {
     }
 
     /// Fetch read-only contact identity and profile without popping an OPK (`GET /bundle/sync/{userId}`)
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn get_sync_bundle(
         &self,
         user_id: &str,
         signing_private_key: &[u8; 32],
         target_user_id: &str,
     ) -> Result<SyncBundleResponse, SdkError> {
-        let url = format!("{}/bundle/sync/{}", self.base_url, urlencoding::encode(target_user_id));
+        let url = format!(
+            "{}/bundle/sync/{}",
+            self.base_url,
+            urlencoding::encode(target_user_id)
+        );
         let headers = self.auth_headers(user_id, signing_private_key)?;
 
         let res = self.client.get(&url).headers(headers).send().await?;
         if !res.status().is_success() {
             let err = res.text().await.unwrap_or_default();
-            return Err(SdkError::Api(format!("Failed to fetch sync bundle: {}", err)));
+            return Err(SdkError::Api(format!(
+                "Failed to fetch sync bundle: {}",
+                err
+            )));
         }
 
         Ok(res.json().await?)
@@ -185,10 +222,7 @@ impl ApiClient {
 pub enum Event {
     Connected,
     Disconnected,
-    MessageReceived {
-        sender: String,
-        plaintext: Vec<u8>,
-    },
+    MessageReceived { sender: String, plaintext: Vec<u8> },
 }
 
 pub struct MqttService {
@@ -209,42 +243,86 @@ fn generate_mqtt_password(user_id: &str, signing_key: &[u8; 32]) -> Result<Strin
     Ok(format!("{}{}{}", sig, vrf, ts))
 }
 
+pub struct MqttConfig<'a> {
+    pub broker_url: &'a str,
+    pub broker_port: u16,
+    pub use_tls: bool,
+    pub user_id: &'a str,
+    pub device_id: &'a str,
+    pub signed_pre_key_private: &'a [u8; 32],
+    pub event_sender: tokio::sync::mpsc::Sender<Event>,
+}
+
+async fn process_message(
+    topic: &str,
+    payload: &[u8],
+    inbox_id: Option<i64>,
+    inbox: &Arc<dyn InboxStore>,
+    sessions: &Arc<dyn SessionStore>,
+    keystore: &Arc<dyn KeyStore>,
+    event_sender: &tokio::sync::mpsc::Sender<Event>,
+) {
+    let parts: Vec<&str> = topic.split('/').collect();
+    if parts.len() >= 6 {
+        let sender_id = parts[4].to_string();
+
+        match decrypt_message(payload, &sender_id, sessions, keystore).await {
+            Ok(plaintext) => {
+                if let Some(id) = inbox_id {
+                    let _ = inbox.mark_inbox_processed(id).await;
+                }
+                let _ = event_sender
+                    .send(Event::MessageReceived {
+                        sender: sender_id,
+                        plaintext,
+                    })
+                    .await;
+            }
+            Err(e) => {
+                if let Some(id) = inbox_id {
+                    let _ = inbox
+                        .mark_inbox_failed(id, &format!("Decryption error: {:?}", e))
+                        .await;
+                }
+            }
+        }
+    } else if let Some(id) = inbox_id {
+        let _ = inbox.mark_inbox_failed(id, "Invalid topic structure").await;
+    }
+}
+
 impl MqttService {
     /// Initializes the MQTT client and spawns a background worker handling
     /// persistent inbox saving, outbox queue flushing, and reconnection retries.
     pub fn new(
-        broker_url: &str,
-        broker_port: u16,
-        use_tls: bool,
-        user_id: &str,
-        device_id: &str,
-        signed_pre_key_private: &[u8; 32],
-        event_sender: tokio::sync::mpsc::Sender<Event>,
+        config: MqttConfig<'_>,
         session_store: Arc<dyn SessionStore>,
         inbox_store: Arc<dyn InboxStore>,
         outbox_store: Arc<dyn OutboxStore>,
         keystore: Arc<dyn KeyStore>,
     ) -> Result<Self, SdkError> {
-        let password = generate_mqtt_password(user_id, signed_pre_key_private)?;
+        let password = generate_mqtt_password(config.user_id, config.signed_pre_key_private)?;
 
-        let mut mqttoptions = MqttOptions::new(device_id, broker_url, broker_port);
-        mqttoptions.set_credentials(user_id, password);
+        let mut mqttoptions =
+            MqttOptions::new(config.device_id, config.broker_url, config.broker_port);
+        mqttoptions.set_credentials(config.user_id, password);
         mqttoptions.set_keep_alive(Duration::from_secs(60));
         mqttoptions.set_clean_session(false);
 
-        if use_tls {
+        if config.use_tls {
             mqttoptions.set_transport(Transport::tls_with_default_config());
         }
 
         let (client, mut eventloop) = AsyncClient::new(mqttoptions, 50);
-        
+
         let client_clone = client.clone();
-        let uid = user_id.to_string();
-        let did = device_id.to_string();
+        let uid = config.user_id.to_string();
+        let did = config.device_id.to_string();
         let inbox = inbox_store.clone();
         let sessions = session_store.clone();
         let keystore_clone = keystore.clone();
-        let spk_priv = *signed_pre_key_private;
+        let spk_priv = *config.signed_pre_key_private;
+        let event_sender = config.event_sender;
         let inflight_messages = Arc::new(AtomicUsize::new(0));
         let inflight_clone = inflight_messages.clone();
 
@@ -260,52 +338,31 @@ impl MqttService {
 
                         if let Ok(pending_inbox) = inbox.get_pending_inbox().await {
                             for item in pending_inbox {
-                                let parts: Vec<&str> = item.topic.split('/').collect();
-                                if parts.len() >= 6 {
-                                    let sender_id = parts[4].to_string();
-                                    
-                                    match decrypt_message(&item.payload, &sender_id, &sessions, &keystore_clone).await {
-                                        Ok(plaintext) => {
-                                            let _ = inbox.mark_inbox_processed(item.id).await;
-                                            let _ = event_sender.send(Event::MessageReceived {
-                                                sender: sender_id,
-                                                plaintext,
-                                            }).await;
-                                        }
-                                        Err(e) => {
-                                            let _ = inbox.mark_inbox_failed(item.id, &format!("Decryption error: {:?}", e)).await;
-                                        }
-                                    }
-                                }
+                                process_message(
+                                    &item.topic,
+                                    &item.payload,
+                                    Some(item.id),
+                                    &inbox,
+                                    &sessions,
+                                    &keystore_clone,
+                                    &event_sender,
+                                )
+                                .await;
                             }
                         }
                     }
                     Ok(MqttEvent::Incoming(Incoming::Publish(p))) => {
                         let inbox_id = inbox.save_to_inbox(&p.topic, &p.payload).await.ok();
-
-                        let parts: Vec<&str> = p.topic.split('/').collect();
-                        if parts.len() >= 6 {
-                            let sender_id = parts[4].to_string();
-                            
-                            match decrypt_message(&p.payload, &sender_id, &sessions, &keystore_clone).await {
-                                Ok(plaintext) => {
-                                    if let Some(id) = inbox_id {
-                                        let _ = inbox.mark_inbox_processed(id).await;
-                                    }
-                                    let _ = event_sender.send(Event::MessageReceived {
-                                        sender: sender_id,
-                                        plaintext,
-                                    }).await;
-                                }
-                                Err(e) => {
-                                    if let Some(id) = inbox_id {
-                                        let _ = inbox.mark_inbox_failed(id, &format!("Decryption error: {:?}", e)).await;
-                                    }
-                                }
-                            }
-                        } else if let Some(id) = inbox_id {
-                            let _ = inbox.mark_inbox_failed(id, "Invalid topic structure").await;
-                        }
+                        process_message(
+                            &p.topic,
+                            &p.payload,
+                            inbox_id,
+                            &inbox,
+                            &sessions,
+                            &keystore_clone,
+                            &event_sender,
+                        )
+                        .await;
                     }
                     Err(_) => {
                         let _ = event_sender.send(Event::Disconnected).await;
@@ -318,7 +375,12 @@ impl MqttService {
                     Ok(MqttEvent::Incoming(Incoming::PubAck(_))) => {
                         let mut current = inflight_clone.load(Ordering::SeqCst);
                         while current > 0 {
-                            match inflight_clone.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                            match inflight_clone.compare_exchange_weak(
+                                current,
+                                current - 1,
+                                Ordering::SeqCst,
+                                Ordering::SeqCst,
+                            ) {
                                 Ok(_) => break,
                                 Err(x) => current = x,
                             }
@@ -337,9 +399,18 @@ impl MqttService {
     }
 
     /// Publishes a payload and marks it sent in the persistent outbox on success.
-    pub async fn send_payload(&self, outbox_id: i64, topic: &str, ciphertext: Vec<u8>) -> Result<(), SdkError> {
+    #[instrument(level = "debug", skip_all, err)]
+    pub async fn send_payload(
+        &self,
+        outbox_id: i64,
+        topic: &str,
+        ciphertext: Vec<u8>,
+    ) -> Result<(), SdkError> {
         self.inflight_messages.fetch_add(1, Ordering::SeqCst);
-        let res = self.client.publish(topic, QoS::AtLeastOnce, false, ciphertext).await;
+        let res = self
+            .client
+            .publish(topic, QoS::AtLeastOnce, false, ciphertext)
+            .await;
         match res {
             Ok(_) => {
                 let _ = self.outbox_store.mark_outbox_sent(outbox_id).await;
@@ -348,17 +419,26 @@ impl MqttService {
             Err(e) => {
                 let mut current = self.inflight_messages.load(Ordering::SeqCst);
                 while current > 0 {
-                    match self.inflight_messages.compare_exchange_weak(current, current - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    match self.inflight_messages.compare_exchange_weak(
+                        current,
+                        current - 1,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    ) {
                         Ok(_) => break,
                         Err(x) => current = x,
                     }
                 }
-                let _ = self.outbox_store.mark_outbox_failed(outbox_id, &e.to_string()).await;
+                let _ = self
+                    .outbox_store
+                    .mark_outbox_failed(outbox_id, &e.to_string())
+                    .await;
                 Err(SdkError::Mqtt(e.to_string()))
             }
         }
     }
 
+    #[instrument(level = "debug", skip_all, err)]
     pub async fn disconnect(&self) -> Result<(), SdkError> {
         let start = tokio::time::Instant::now();
         let timeout = std::time::Duration::from_secs(5);
@@ -368,7 +448,10 @@ impl MqttService {
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        self.client.disconnect().await.map_err(|e| SdkError::Mqtt(e.to_string()))?;
+        self.client
+            .disconnect()
+            .await
+            .map_err(|e| SdkError::Mqtt(e.to_string()))?;
         Ok(())
     }
 }
@@ -382,7 +465,8 @@ mod tests {
     fn test_generate_mqtt_password() {
         let keypair = gen_keypair();
         let user_id = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
-        let password = generate_mqtt_password(user_id, &keypair.secret).expect("failed to generate password");
+        let password =
+            generate_mqtt_password(user_id, &keypair.secret).expect("failed to generate password");
         assert_eq!(password.len(), 182);
 
         let sig_b64 = &password[..128];
@@ -390,10 +474,13 @@ mod tests {
         let ts_str = &password[172..];
 
         let ts: u64 = ts_str.parse().expect("timestamp should be an integer");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         assert!(now.abs_diff(ts) <= 2);
 
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
         use libsignal_dezire::vxeddsa::vxeddsa_verify;
 
         let sig_bytes = STANDARD.decode(sig_b64).expect("valid sig base64");
@@ -402,7 +489,8 @@ mod tests {
 
         let mut sig_arr = [0u8; 96];
         sig_arr.copy_from_slice(&sig_bytes);
-        let verified_vrf = vxeddsa_verify(&keypair.public, payload.as_bytes(), &sig_arr).expect("signature should verify");
+        let verified_vrf = vxeddsa_verify(&keypair.public, payload.as_bytes(), &sig_arr)
+            .expect("signature should verify");
         assert_eq!(verified_vrf.as_slice(), vrf_bytes.as_slice());
     }
 

@@ -1,9 +1,15 @@
 [package]
-name = "deezchatz-sdk-rust"
-version = "0.1.0"
+name = "deezchatz-sdk"
+version = "0.2.0"
 edition = "2021"
 description = "A programmatic SDK for the DeezChatz API and MQTT broker."
 authors = ["DeezChatz"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/deez-in/deezchatz-sdk-rust"
+homepage = "https://deez.in"
+documentation = "https://docs.rs/deezchatz-sdk"
+keywords = ["messaging", "mqtt", "signal-protocol", "e2ee", "sdk"]
+categories = ["network-programming", "cryptography", "asynchronous"]
 
 [dependencies]
 # Async runtime
@@ -16,8 +22,8 @@ thiserror = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
 rumqttc = { version = "0.24", features = ["use-rustls"] }
 
-# Crypto / Signal Protocol (using the local sibling repo)
-libsignal-dezire = { path = "../libsignal-dezire" }
+# Crypto / Signal Protocol (using the published crate)
+libsignal-dezire = "0.2.0"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

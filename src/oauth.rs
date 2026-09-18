@@ -1,4 +1,7 @@
-use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use rand::RngCore;
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
@@ -96,7 +99,10 @@ pub async fn register_google_pkce(
     let res = http_client.post(&url).json(&req_body).send().await?;
     if !res.status().is_success() {
         let err = res.text().await.unwrap_or_default();
-        return Err(SdkError::Api(format!("Google PKCE registration failed: {}", err)));
+        return Err(SdkError::Api(format!(
+            "Google PKCE registration failed: {}",
+            err
+        )));
     }
 
     Ok(res.json().await?)

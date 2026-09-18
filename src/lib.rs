@@ -24,8 +24,8 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use deezchatz_sdk_rust::{DeezChatzClient, ClientConfig, Event, decode_payload, DecodedPayload};
-//! # use deezchatz_sdk_rust::{KeyStore, SessionStore, InboxStore, OutboxStore, SdkError};
+//! use deezchatz_sdk::{DeezChatzClient, ClientConfig, Event, decode_payload, DecodedPayload};
+//! # use deezchatz_sdk::{KeyStore, SessionStore, InboxStore, OutboxStore, SdkError};
 //! # use async_trait::async_trait;
 //! # struct DummyStore;
 //! # #[async_trait] impl KeyStore for DummyStore {
@@ -45,13 +45,13 @@
 //! #     async fn save_to_inbox(&self, _: &str, _: &[u8]) -> Result<i64, SdkError> { Ok(1) }
 //! #     async fn mark_inbox_processed(&self, _: i64) -> Result<(), SdkError> { Ok(()) }
 //! #     async fn mark_inbox_failed(&self, _: i64, _: &str) -> Result<(), SdkError> { Ok(()) }
-//! #     async fn get_pending_inbox(&self) -> Result<Vec<deezchatz_sdk_rust::InboxEntry>, SdkError> { Ok(vec![]) }
+//! #     async fn get_pending_inbox(&self) -> Result<Vec<deezchatz_sdk::InboxEntry>, SdkError> { Ok(vec![]) }
 //! # }
 //! # #[async_trait] impl OutboxStore for DummyStore {
 //! #     async fn save_to_outbox(&self, _: &str, _: &str, _: &str, _: &[u8]) -> Result<i64, SdkError> { Ok(1) }
 //! #     async fn mark_outbox_sent(&self, _: i64) -> Result<(), SdkError> { Ok(()) }
 //! #     async fn mark_outbox_failed(&self, _: i64, _: &str) -> Result<(), SdkError> { Ok(()) }
-//! #     async fn get_pending_outbox(&self) -> Result<Vec<deezchatz_sdk_rust::OutboxEntry>, SdkError> { Ok(vec![]) }
+//! #     async fn get_pending_outbox(&self) -> Result<Vec<deezchatz_sdk::OutboxEntry>, SdkError> { Ok(vec![]) }
 //! # }
 //!
 //! #[tokio::main]
@@ -101,15 +101,15 @@ pub mod messaging;
 pub mod oauth;
 pub mod transport;
 
-pub use transport::SyncBundleResponse;
 pub use client::{ClientConfig, DeezChatzClient, SentMessage};
 pub use error::SdkError;
-pub use transport::Event;
 pub use messaging::{
     decode_payload, encode_image_payload, encode_text_payload, encode_voice_payload,
-    DecodedPayload, PayloadError, PAYLOAD_TYPE_IMAGE, PAYLOAD_TYPE_TEXT, PAYLOAD_TYPE_VOICE,
-    InboxEntry, InboxStore, MessageStatus, OutboxEntry, OutboxStore, SessionStore, KeyStore,
+    DecodedPayload, InboxEntry, InboxStore, KeyStore, MessageStatus, OutboxEntry, OutboxStore,
+    PayloadError, SessionStore, PAYLOAD_TYPE_IMAGE, PAYLOAD_TYPE_TEXT, PAYLOAD_TYPE_VOICE,
 };
+pub use transport::Event;
+pub use transport::SyncBundleResponse;
 
 pub use base64;
 pub use libsignal_dezire;

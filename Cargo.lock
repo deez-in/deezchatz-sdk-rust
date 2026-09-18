@@ -221,8 +221,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "deezchatz-sdk-rust"
-version = "0.1.0"
+name = "deezchatz-sdk"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -747,7 +747,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libsignal-dezire"
-version = "0.1.146"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "143f3eea1c9727a245cdb86145d742d341c3d69554bd4423c734aecc7a655552"
 dependencies = [
  "aes",
  "aes-gcm",

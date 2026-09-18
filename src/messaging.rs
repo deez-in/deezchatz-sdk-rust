@@ -1,7 +1,7 @@
+use crate::error::SdkError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use crate::error::SdkError;
 
 // ---------------------------------------------------------------------------
 // Payload Encoding & Decoding
@@ -149,12 +149,27 @@ pub fn decode_payload(bytes: &[u8]) -> Result<DecodedPayload, PayloadError> {
 /// Represents an abstract storage backend for cryptographic keys.
 #[async_trait]
 pub trait KeyStore: Send + Sync {
-    async fn save_identity_key(&self, private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<(), SdkError>;
+    async fn save_identity_key(
+        &self,
+        private_key: &[u8; 32],
+        public_key: &[u8; 33],
+    ) -> Result<(), SdkError>;
     async fn get_identity_key(&self) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
-    async fn save_signed_pre_key(&self, id: u32, private_key: &[u8; 32], public_key: &[u8; 33]) -> Result<(), SdkError>;
+    async fn save_signed_pre_key(
+        &self,
+        id: u32,
+        private_key: &[u8; 32],
+        public_key: &[u8; 33],
+    ) -> Result<(), SdkError>;
     async fn get_signed_pre_key(&self, id: u32) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
-    async fn save_one_time_pre_keys(&self, keys: Vec<(u32, [u8; 32], [u8; 33])>) -> Result<(), SdkError>;
-    async fn consume_one_time_pre_key(&self, id: u32) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
+    async fn save_one_time_pre_keys(
+        &self,
+        keys: Vec<(u32, [u8; 32], [u8; 33])>,
+    ) -> Result<(), SdkError>;
+    async fn consume_one_time_pre_key(
+        &self,
+        id: u32,
+    ) -> Result<Option<([u8; 32], [u8; 33])>, SdkError>;
 }
 
 /// Represents an abstract storage backend for Signal Protocol sessions.
@@ -388,10 +403,7 @@ mod tests {
         let invalid_payload = vec![0x05, 0x01, 0x02];
         let err = decode_payload(&invalid_payload).unwrap_err();
         assert_eq!(err, PayloadError::UnrecognizedType(5));
-        assert_eq!(
-            err.to_string(),
-            "Unrecognized message payload type byte: 5"
-        );
+        assert_eq!(err.to_string(), "Unrecognized message payload type byte: 5");
 
         let legacy_ascii_payload = b"Hello legacy";
         let err2 = decode_payload(legacy_ascii_payload).unwrap_err();
